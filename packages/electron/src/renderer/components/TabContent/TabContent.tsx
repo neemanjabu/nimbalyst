@@ -23,8 +23,11 @@ import { CollaborativeTabEditor } from '../TabEditor/CollaborativeTabEditor';
 import type { DocumentSessionActions } from '../TabEditor/DocumentSessionControl';
 import { TabEditorErrorBoundary } from '../TabEditorErrorBoundary';
 import { logger } from '../../utils/logger';
-import { useTabsActions, type TabData, notifyDirtyStateChange, isTrackerTabPath } from '../../contexts/TabsContext';
+import { useTabsActions, type TabData, notifyDirtyStateChange, isTrackerTabPath, isTypeTabPath, TYPE_TAB_PREFIX, isPersonalPageTabPath, PERSONAL_PAGE_TAB_PREFIX } from '../../contexts/TabsContext';
+import { PersonalPageTab } from '../CollabMode/PersonalPageTab';
 import { TrackerResourceEditor } from '../AgentMode/TrackerResourceEditor';
+import { TrackerPageView } from '../TrackerMode/TrackerPageView';
+import { TypePageTab } from '../CollabMode/TypePageTab';
 import { SharedDocsListView } from '@nimbalyst/collab-client/docs-ui';
 import { ElectronCollabDocsUIRoot } from '../CollabMode/ElectronCollabDocsUIProvider';
 import { isSharedHomeTab } from '../CollabMode/sharedHomeTab';
@@ -64,6 +67,9 @@ interface TabContentProps {
   // Workstream-scoped; passed by the workstream host so TabContent stays
   // workstream-agnostic.
   onOpenTracker?: (trackerItemId: string) => void;
+  // Pages mode: tracker tabs render as typed pages (TrackerPageView), not the
+  // tracker detail pane.
+  trackerPageHeader?: boolean;
   // Owning workstream id (when this TabContent hosts a workstream strip) — used
   // to persist per-tracker-tab content-focus state.
   workstreamId?: string;
@@ -95,6 +101,7 @@ const TabContentComponent: React.FC<TabContentProps> = ({
   onOpenSessionInChat,
   onTabClose,
   onOpenTracker,
+  trackerPageHeader,
   documentSessionActions,
   workstreamId,
   workspaceId,
@@ -129,6 +136,7 @@ const TabContentComponent: React.FC<TabContentProps> = ({
     onOpenSessionInChat,
     onTabClose,
     onOpenTracker,
+    trackerPageHeader,
     documentSessionActions,
     workstreamId,
     workspaceId,
@@ -144,6 +152,7 @@ const TabContentComponent: React.FC<TabContentProps> = ({
     onOpenSessionInChat,
     onTabClose,
     onOpenTracker,
+    trackerPageHeader,
     documentSessionActions,
     workstreamId,
     workspaceId,
@@ -162,7 +171,7 @@ const TabContentComponent: React.FC<TabContentProps> = ({
   const loadContent = useCallback(async (filePath: string, title?: string): Promise<string> => {
     // Tracker resources don't load from disk -- the tracker body is owned by
     // TrackerItemDetail (PGLite or collaborative Y.Doc).
-    if (isTrackerTabPath(filePath)) {
+    if (isTrackerTabPath(filePath) || isTypeTabPath(filePath) || isPersonalPageTabPath(filePath)) {
       return '';
     }
 
@@ -390,11 +399,13 @@ const TabContentComponent: React.FC<TabContentProps> = ({
       return;
     }
 
-    // Tracker resource tabs render the tracker detail host, not a file editor.
-    // No save/dirty/getContent wiring — the tracker owns its own persistence
-    // (PGLite / collaborative Y.Doc via TrackerItemDetail).
+    // Tracker resource tabs render the tracker detail host (or, in Pages mode,
+    // the typed page), not a file editor. No save/dirty/getContent wiring — the
+    // tracker owns its own persistence (PGLite / collaborative Y.Doc via
+    // useTrackerItemBody).
     if (tab.kind === 'tracker' || isTrackerTabPath(tab.filePath)) {
       const trackerItemId = tab.trackerItemId ?? tab.filePath.replace(/^tracker:\/\//, '');
+      const pageWorkspacePath = propsRef.current.trackerPageHeader ? propsRef.current.workspaceId : undefined;
       root.render(
         <JotaiProvider store={store}>
           <TabEditorErrorBoundary
@@ -408,18 +419,27 @@ const TabContentComponent: React.FC<TabContentProps> = ({
               propsRef.current.onTabClose?.(tab.id);
             }}
           >
-            <TrackerResourceEditor
-              trackerItemId={trackerItemId}
-              workspacePath={propsRef.current.workspaceId}
-              workstreamId={propsRef.current.workstreamId}
-              onClose={() => propsRef.current.onTabClose?.(tab.id)}
-              onOpenTracker={propsRef.current.onOpenTracker}
-              onSwitchToAgentMode={
-                propsRef.current.onSwitchToAgentMode
-                  ? (sessionId: string) => propsRef.current.onSwitchToAgentMode?.(undefined, sessionId)
-                  : undefined
-              }
-            />
+            {pageWorkspacePath ? (
+              <TrackerPageView
+                itemId={trackerItemId}
+                workspacePath={pageWorkspacePath}
+                collabScope={propsRef.current.collabScope}
+                onOpenItem={(itemId) => propsRef.current.onOpenTracker?.(itemId)}
+              />
+            ) : (
+              <TrackerResourceEditor
+                trackerItemId={trackerItemId}
+                workspacePath={propsRef.current.workspaceId}
+                workstreamId={propsRef.current.workstreamId}
+                onClose={() => propsRef.current.onTabClose?.(tab.id)}
+                onOpenTracker={propsRef.current.onOpenTracker}
+                onSwitchToAgentMode={
+                  propsRef.current.onSwitchToAgentMode
+                    ? (sessionId: string) => propsRef.current.onSwitchToAgentMode?.(undefined, sessionId)
+                    : undefined
+                }
+              />
+            )}
           </TabEditorErrorBoundary>
         </JotaiProvider>
       );
@@ -427,7 +447,66 @@ const TabContentComponent: React.FC<TabContentProps> = ({
       return;
     }
 
-    const handleManualSaveReady = (saveFn: () => Promise<void>) => {
+    // A tracker type's page (Pages mode): the type's table, nothing to save.
+    if (tab.kind === 'type' || isTypeTabPath(tab.filePath)) {
+      const typeId = tab.trackerTypeId ?? tab.filePath.slice(TYPE_TAB_PREFIX.length);
+      const workspacePath = propsRef.current.workspaceId;
+      root.render(
+        <JotaiProvider store={store}>
+          <TabEditorErrorBoundary
+            filePath={tab.filePath}
+            fileName={tab.fileName}
+            onRetry={() => {
+              removeTabEditor(tab.id);
+              createTabEditor(tab, content);
+            }}
+            onClose={() => {
+              propsRef.current.onTabClose?.(tab.id);
+            }}
+          >
+            {workspacePath ? (
+              <TypePageTab
+                typeId={typeId}
+                workspacePath={workspacePath}
+                onOpenItem={(itemId) => propsRef.current.onOpenTracker?.(itemId)}
+              />
+            ) : null}
+          </TabEditorErrorBoundary>
+        </JotaiProvider>
+      );
+      tabInstancesRef.current.set(tab.id, { root, element, tabData: tab, content });
+      return;
+    }
+
+    // A personal page (Pages mode): its body saves itself through local IPC,
+    // so no save/dirty/getContent wiring.
+    if (tab.kind === 'personal-page' || isPersonalPageTabPath(tab.filePath)) {
+      const documentId = tab.personalDocumentId ?? tab.filePath.slice(PERSONAL_PAGE_TAB_PREFIX.length);
+      const workspacePath = propsRef.current.workspaceId;
+      root.render(
+        <JotaiProvider store={store}>
+          <TabEditorErrorBoundary
+            filePath={tab.filePath}
+            fileName={tab.fileName}
+            onRetry={() => {
+              removeTabEditor(tab.id);
+              createTabEditor(tab, content);
+            }}
+            onClose={() => {
+              propsRef.current.onTabClose?.(tab.id);
+            }}
+          >
+            {workspacePath ? (
+              <PersonalPageTab documentId={documentId} workspacePath={workspacePath} fallbackTitle={tab.fileName} />
+            ) : null}
+          </TabEditorErrorBoundary>
+        </JotaiProvider>
+      );
+      tabInstancesRef.current.set(tab.id, { root, element, tabData: tab, content });
+      return;
+    }
+
+    const handleManualSaveReady =(saveFn: () => Promise<void>) => {
       saveFunctionsRef.current.set(tab.id, saveFn);
       if (tab.id === activeTabIdRef.current && propsRef.current.onManualSaveReady) {
         propsRef.current.onManualSaveReady(saveFn);

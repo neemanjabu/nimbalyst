@@ -1,7 +1,11 @@
 import React from 'react';
 import './collabSidebarTree.css';
+import { type SharedDocument, type CollabTypeTreeResolver } from '../docs/index';
 export interface CollabSidebarProps {
     activeDocumentId?: string | null;
+    /** The open typed page (item id) or type page (type id), highlighted like the open page. */
+    activeItemId?: string | null;
+    activeTypeId?: string | null;
     /** Open the discovery hub (center pane). Shown as a Home action. */
     onShowHome?: () => void;
     /** Highlight the Home action when the hub is the active surface. */
@@ -23,6 +27,27 @@ export interface CollabSidebarProps {
      * the host would drift from it.
      */
     registerCreateMenu?: (menu: CollabSidebarCreateMenu | null) => void;
+    /**
+     * Names placed tracker types and lists their items. Hosts without tracker
+     * data omit it, and the tree then shows no type nodes.
+     */
+    typeResolver?: CollabTypeTreeResolver;
+    /**
+     * Shows this tree as one section of a stacked sidebar ("Team", "Personal"):
+     * a compact section header replaces the scope summary header.
+     */
+    sectionTitle?: string;
+    /**
+     * Section only: with `onToggleCollapsed` the title row becomes a toggle, and
+     * a collapsed section renders that row alone (no filters, search or tree).
+     */
+    collapsed?: boolean;
+    onToggleCollapsed?: () => void;
+    /**
+     * Page tree only: turn a plain page into a typed page in place. Without it
+     * the menu's "Set type" entry is shown disabled.
+     */
+    onSetPageType?: (document: SharedDocument) => void;
 }
 export interface CollabSidebarCreateMenu {
     items: Array<{
@@ -38,5 +63,7 @@ export interface CollabSidebarCreateMenu {
     /** Extension the default action produces, shown beside it. */
     primaryTrailing?: string;
     onNewFolder: () => void;
+    /** True when this tree has pages instead of folders (no "New folder"). */
+    pageTree?: boolean;
 }
 export declare const CollabSidebar: React.FC<CollabSidebarProps>;

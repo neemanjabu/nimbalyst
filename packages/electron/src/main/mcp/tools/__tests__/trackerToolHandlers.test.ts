@@ -1,5 +1,8 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 const {
   mockQuery,
@@ -105,6 +108,21 @@ vi.mock('../../../services/TrackerSyncManager', () => ({
   isTrackerSyncConfigured: vi.fn(() => false),
   syncTrackerItem: vi.fn(),
   onTrackerItemApplied: mockOnTrackerItemApplied,
+  // The wire shape, minus the labels CRDT these tests never exercise.
+  trackerItemToPayload: (item: any) => {
+    const record = trackerItemToRecord(item);
+    return {
+      itemId: record.id,
+      primaryType: record.primaryType,
+      archived: record.archived,
+      bodyVersion: 0,
+      fields: { ...record.fields },
+      labels: {},
+      comments: record.system.comments ?? [],
+      activity: record.system.activity ?? [],
+      system: {},
+    };
+  },
 }));
 
 // The wait itself (ack listener, pre-read, timeout) is covered in
@@ -135,6 +153,8 @@ vi.mock('../../../services/TrackerSchemaService', () => {
     writeThroughTeamTrackerSchemaEdit: mockWriteThroughTeamTrackerSchemaEdit,
     getAllTrackerSchemas: mockGetAllTrackerSchemas,
     isBuiltinTrackerSchema: mockIsBuiltinTrackerSchema,
+    applyWorkspacePredicateRegistryInProcess: vi.fn(),
+    applyWorkspaceLabelRegistryInProcess: vi.fn(),
     TrackerTypeExistsError: MockTrackerTypeExistsError,
   };
 });
@@ -206,6 +226,7 @@ import {
   TRACKER_LOCAL_ISSUE_KEY_MESSAGE,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerLifecycle';
 import { READINESS_FILTER_FIELD } from '@nimbalyst/tracker-schema';
+import { trackerItemToRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 
 describe('work radar activity', () => {
   beforeEach(() => {
@@ -1508,6 +1529,44 @@ describe('tracker schema tools', () => {
     });
   });
 
+  it('reports vocabulary it already wrote when the type half of the call then fails', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-define-type-'));
+    try {
+      mockUpsertWorkspaceTrackerSchema.mockRejectedValue(new Error('Type \'library\' extends unknown type \'technology\''));
+      const result = await handleTrackerDefineType({
+        predicates: [{ id: 'built-on', label: 'built on', subjectKinds: ['*'], valueShape: 'entity', direction: 'directed' }],
+        schema: { type: 'library', extends: 'technology' },
+      }, workspace);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('extends unknown type');
+      expect(result.content[0].text).toContain('Merged into .nimbalyst/predicates.yaml');
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses the retired `labels` argument without touching an existing labels.yaml', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-define-type-'));
+    try {
+      const labelsFile = path.join(workspace, '.nimbalyst', 'labels.yaml');
+      fs.mkdirSync(path.dirname(labelsFile), { recursive: true });
+      fs.writeFileSync(labelsFile, 'labels:\n  - id: feature\n    label: Feature\n');
+      const result = await handleTrackerDefineType({
+        predicates: [{ id: 'built-on', label: 'built on', subjectKinds: ['*'], valueShape: 'entity', direction: 'directed' }],
+        labels: { labels: [{ id: 'capability', label: 'Capability' }] },
+      }, workspace);
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('`labels` is no longer supported');
+      expect(fs.readFileSync(labelsFile, 'utf-8')).toBe('labels:\n  - id: feature\n    label: Feature\n');
+      // Refused before any vocabulary was written.
+      expect(fs.existsSync(path.join(workspace, '.nimbalyst', 'predicates.yaml'))).toBe(false);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('defines a custom tracker type through the schema service', async () => {
     mockUpsertWorkspaceTrackerSchema.mockResolvedValue({
       model: {
@@ -2395,6 +2454,7 @@ describe('handleTrackerUpdate description / collab body', () => {
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // notifyTrackerItemUpdated read
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // refreshedRow read for sync block
       .mockResolvedValueOnce({ rows: [trackerRow] })                          // postSyncRow read
+      .mockResolvedValueOnce({ rows: [] })                                    // DELETE body-link edges (body has no links)
       .mockResolvedValueOnce({ rows: [{ type_tags: ['bug'] }] });             // re-read type_tags
     return trackerRow;
   }
@@ -3104,5 +3164,58 @@ describe('handleTrackerCreate schema defaults', () => {
     setupCreateQueue();
     await handleTrackerCreate({ type: 'task', title: 'A task' }, '/tmp/ws');
     expect(insertedData().status).toBe('to-do');
+  });
+});
+
+// Saving first and letting the sync refusal be swallowed told the agent the
+// write succeeded, queued nothing, and left a teammate's next edit to overwrite
+// it. Activity caps do not bound field values or comments.
+describe('agent writes that would make a shared item too large for its room', () => {
+  const huge = 'x'.repeat(300 * 1024);
+  const writes: string[] = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    writes.length = 0;
+    mockGlobalRegistry.get.mockReturnValue(undefined);
+    mockGlobalRegistry.validate.mockReturnValue({ valid: true, errors: [] });
+    vi.mocked(getEffectiveTrackerSharingPolicy).mockReturnValue({ sharing: 'team', draftByDefault: false });
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(true);
+    const row = makeRow({ workspace: '/tmp/ws', source: 'native', document_path: '', created: '2026-04-01T00:00:00.000Z', last_indexed: '2026-04-02T00:00:00.000Z' });
+    mockQuery.mockImplementation(async (sql: string) => {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('SELECT')) return { rows: [row] };
+      writes.push(normalized);
+      return { rows: [] };
+    });
+  });
+
+  afterEach(() => {
+    vi.mocked(getEffectiveTrackerSharingPolicy).mockReturnValue({ sharing: 'personal', draftByDefault: false });
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(isTrackerSyncConfigured).mockReturnValue(false);
+    mockQuery.mockReset();
+  });
+
+  function expectRefusedBeforeAnyWrite(result: { isError: boolean; content: Array<{ text?: string }> }) {
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/too large/);
+    expect(writes.filter(sql => sql.includes('tracker_items'))).toEqual([]);
+    expect(syncTrackerItem).not.toHaveBeenCalled();
+  }
+
+  it('tracker_update refuses a field value', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerUpdate({ id: 'NIM-1', fields: { notes: huge } }, '/tmp/ws'));
+  });
+
+  it('tracker_create refuses a field value', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerCreate({ type: 'bug', title: 'Big', fields: { notes: huge } }, '/tmp/ws'));
+  });
+
+  it('tracker_add_comment refuses a comment body', async () => {
+    expectRefusedBeforeAnyWrite(await handleTrackerAddComment({ trackerId: 'NIM-1', body: huge }, '/tmp/ws'));
   });
 });

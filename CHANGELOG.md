@@ -10,17 +10,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Pages mode: pages nest inside pages, and a tracker type placed in the tree opens as a page with its own prose above a table of every item of that type. Typed pages open as document pages with a header of single-valued fields and can hold their own child pages; pages and typed pages can be moved or reordered by drag, and a plain page, children included, can be given a type in place. A tracker type can extend another type and nests inside it. The Team and Personal sections collapse. Hovering a link in a page offers the named relations allowed between the two pages' types, and a Links section at the bottom lists each relation on one line, incoming ones under their inverse name, with the sentence that made the link. Each section starts with an editable Home page, and New page is offered from a right-click on empty space or a section header. A page that only holds other pages shows a folder icon until it gets content.
+- Pages: a sentence can be marked as decided or as an open question, with who and when; a page can cite a person's prompt, answer or comment, or a web source, with a Sources line under the page; and a type's editable table, a 2x2 chart, or a list of decisions and open questions across pages can be placed in any page.
+- Agents can list, create, place, reorder, retype and edit pages in both the Team and Personal sections and cite what you said in the session; each page an agent edits gets a line in the transcript.
+- Pages mode has a Personal section that works with no account or team: personal pages and tracker types are stored on this device.
 - Phase toggles in the agent mode session list hide or show sessions by phase, with Complete hidden by default.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Shared page history compares a version with the previous one or the current page in red and green, like local file history.
+- Confirmations and error messages across the desktop app (deleting files, pages and tracker items, emptying Trash, overwrite and restore prompts, settings) use in-app dialogs and notifications instead of system dialogs.
+- Agent edits to shared pages and typed page bodies now apply directly instead of waiting for Keep or Revert; a version is saved to the page's history before an agent starts editing.
+- Shared Docs mode is now called Pages.
+- New links in pages are console.nimbalyst.com links that open in the desktop app when it can show the page.
+- The Knowledge extension's skills now write pages, typed pages and linked relations instead of claim and finding items.
+- The Claude Code plugin for team knowledge is now `nimbalyst-pages` and works on Pages, and `nim wiki` is now `nim pages`.
+- Enlarged transcript images can be zoomed with a two-finger pinch on touch screens or a trackpad pinch.
+- iOS: the session list and session header take less space, with search and filters in the toolbar and the prompt list in the session title's popover.
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Pages: a page deleted by an agent, or a page with child pages deleted from the sidebar, now goes to Trash instead of being deleted permanently.
+- Team trackers: sync no longer fails to start in a workspace where one item had built up a backlog of unsent edits too large to load, and an edit that would make a shared item too large to sync is refused with an error instead of appearing saved.
+- Phone sync: a project file over the size limit no longer stops the other files in the same upload from syncing; the oversized file is skipped.
+- Pages: team sync no longer stops with "Data source has been disposed" after the Pages view recovers from an error.
+- Knowledge graph label properties and relation names now load for the open project instead of staying unavailable until a schema change.
 - A Mermaid diagram with a syntax error no longer leaves stray error graphics behind that could push a project window's title bar out of view.
+- Clicking an editor screenshot in the transcript now enlarges it over the whole window instead of only the transcript pane.
+- macOS: opening the menu bar panel or island no longer removes Nimbalyst from the Dock and Cmd+Tab.
+- Android: a prompt is no longer lost when you leave the session mid-send or the connection has silently dropped, and a phone left offline in the background no longer gets signed out.
+- Android: the app no longer crashes at launch while the system WebView is updating, after moving to a new phone, or on devices without a browser or camera app.
+- iOS: the "Sync interrupted" notice now clears once the app reconnects after being backgrounded, and is shown as a smaller, quieter strip.
+- Windows: projects directly under a drive root (such as `D:\Project`) can now send prompts instead of failing with a "workspace path is too shallow" error.
 
 ### Removed
 <!-- Removed features go here -->
+- Tracker items no longer show the earlier knowledge graph's claim statements and qualifier editors; values already stored are kept.
 
 ## [0.79.1] - 2026-09-30
 

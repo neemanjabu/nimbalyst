@@ -21,6 +21,7 @@ import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
 import { isCollabUri } from '@nimbalyst/collab-protocol';
 
 import {
+  acquireHeadlessCollabDocument,
   HeadlessCollabDocumentError,
   readHeadlessCollabDocContent,
 } from './HeadlessCollabDocument';
@@ -28,6 +29,15 @@ import {
   applyHeadlessCollabDocEdit,
   type CollabDocAgentIdentity,
 } from './HeadlessCollabDocEdit';
+import {
+  hasRecentAgentEditRevision,
+  recordRevisionBeforeAgentEdit,
+  revisionSourceFromAcquisition,
+  revisionSourceFromOpenTab,
+} from './collabAgentEditRevision';
+import { applyPersonalPageAgentEdit, readPersonalPageForAgent } from './personalAgentEdit';
+import { isPersonalPageUri } from '../../shared/personalPageUri';
+import { agentPageTitle } from '../utils/agentEditedPage';
 
 export type CollabDocAccessRoute = 'mounted' | 'headless';
 
@@ -40,6 +50,8 @@ export interface AgentDiffResult {
   success: boolean;
   error?: string;
   code?: string;
+  /** The edited page's title, when it is a page this window can name. */
+  title?: string;
 }
 
 export interface AgentDiffOptions {
@@ -60,6 +72,9 @@ export async function readCollabDocForAgent(
   documentUri: string,
   workspacePath: string | null | undefined,
 ): Promise<CollabDocReadResult> {
+  if (isPersonalPageUri(documentUri)) {
+    return { content: await readPersonalPageForAgent(documentUri, workspacePath), route: 'headless' };
+  }
   if (editorRegistry.has(documentUri)) {
     return { content: editorRegistry.getContent(documentUri), route: 'mounted' };
   }
@@ -76,6 +91,40 @@ export async function readCollabDocForAgent(
 }
 
 /**
+ * A mounted shared document takes the agent edit as final text (the editor
+ * decides that from its `collab://` path), so record the pre-edit state in its
+ * version history first. A tab publishes a history controller; a document open
+ * only as an embed is reached through the embed's own cached provider, so this
+ * adds no second peer to the room. Never throws.
+ */
+async function recordRevisionBeforeMountedCollabEdit(
+  documentUri: string,
+  workspacePath: string | null | undefined,
+): Promise<void> {
+  if (hasRecentAgentEditRevision(documentUri)) return;
+  try {
+    const fromTab = revisionSourceFromOpenTab(documentUri);
+    if (fromTab) {
+      await recordRevisionBeforeAgentEdit(documentUri, fromTab);
+      return;
+    }
+    if (!workspacePath) return;
+    const acquisition = await acquireHeadlessCollabDocument(documentUri, workspacePath);
+    try {
+      const source = revisionSourceFromAcquisition(acquisition);
+      if (source) await recordRevisionBeforeAgentEdit(documentUri, source);
+    } finally {
+      acquisition.release();
+    }
+  } catch (error) {
+    console.warn(
+      `[agentDocumentAccess] Could not record the pre-edit revision of ${documentUri}; applying the agent edit anyway.`,
+      error,
+    );
+  }
+}
+
+/**
  * Apply an agent's replacements to a markdown file or a shared document.
  *
  * Returns a result rather than throwing, because both callers report the
@@ -87,6 +136,23 @@ export async function applyAgentDiff(
   replacements: TextReplacement[],
   options: AgentDiffOptions = {},
 ): Promise<AgentDiffResult> {
+  const result = await applyAgentDiffToTarget(targetFilePath, replacements, options);
+  if (!result.success || !(isCollabUri(targetFilePath) || isPersonalPageUri(targetFilePath))) return result;
+  const title = agentPageTitle(targetFilePath, options.workspacePath);
+  return title ? { ...result, title } : result;
+}
+
+async function applyAgentDiffToTarget(
+  targetFilePath: string,
+  replacements: TextReplacement[],
+  options: AgentDiffOptions,
+): Promise<AgentDiffResult> {
+  if (isPersonalPageUri(targetFilePath)) {
+    return applyPersonalPageAgentEdit(targetFilePath, replacements, {
+      workspacePath: options.workspacePath,
+      requestId: options.requestId,
+    });
+  }
   const isCollab = isCollabUri(targetFilePath);
   if (!isCollab && !targetFilePath.endsWith('.md')) {
     return {
@@ -133,6 +199,10 @@ export async function applyAgentDiff(
       targetFilePath,
       result?.success ? result.content : '',
     );
+  }
+
+  if (isCollab) {
+    await recordRevisionBeforeMountedCollabEdit(targetFilePath, options.workspacePath);
   }
 
   const result = await editorRegistry.applyReplacements(
