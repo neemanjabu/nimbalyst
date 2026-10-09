@@ -9,6 +9,7 @@ import type {
   ItemPlacementNode,
   PageLinkEntry,
   PageMarkEntry,
+  PageSearchHit,
   TeamClientMessage,
   TeamServerMessage,
   TeamState,
@@ -44,6 +45,7 @@ const pageUnderItem = {
   fileExtension: '.md', editorId: 'com.nimbalyst.markdown', createdBy: 'member-1', createdAt: 1790000000000,
   updatedAt: 1790000002000, projectId: 'project-1', lastWriterUserId: 'member-1', parentFolderId: 'NIM-42',
   parentKind: 'item', sortOrder: 2048, trashedAt: null, hasContent: true,
+  fields: { status: 'current', owner: 'greg@example.com', summary: 'Meeting notes', tags: ['notes'] },
 } satisfies Exhaustive<EncryptedDocIndexEntry>;
 
 const pageTreeTeam = {
@@ -58,6 +60,8 @@ const pageTreeTeam = {
     projectId: 'project-1', lastWriterUserId: null, parentFolderId: null, parentKind: 'page', sortOrder: null,
     // A converted folder: its body was never edited, so the tree shows a folder.
     trashedAt: null, hasContent: false,
+    // No fields set.
+    fields: null,
   }, pageUnderItem],
   // The older-client projection: the page has a child placement.
   folders: [{
@@ -66,9 +70,10 @@ const pageTreeTeam = {
   }],
   pageTree: true,
   authorWriteEcho: true,
+  pageFields: true,
   typePlacements: [typeNode],
   itemPlacements: [node, childNode],
-} satisfies Omit<TeamState, 'settings'> & Exhaustive<Pick<TeamState, 'folders' | 'pageTree' | 'authorWriteEcho' | 'typePlacements' | 'itemPlacements'>>;
+} satisfies Omit<TeamState, 'settings'> & Exhaustive<Pick<TeamState, 'folders' | 'pageTree' | 'authorWriteEcho' | 'pageFields' | 'typePlacements' | 'itemPlacements'>>;
 
 // A decision on a plain page, and an open question in a typed page's body
 // (no project or title: the client resolves the tracker item).
@@ -76,11 +81,12 @@ const decidedMark = {
   documentId: 'page-1', projectId: 'project-1', title: 'Specs', kind: 'decided',
   text: 'Storage lives in [Flagship](https://console.nimbalyst.com/x).', plainText: 'Storage lives in Flagship.',
   by: 'Greg Hinkle', email: 'greg@example.com', on: '2026-09-30', over: 'our own engine', line: 3, offset: 41,
-} satisfies Exhaustive<PageMarkEntry>;
+} satisfies Omit<Exhaustive<PageMarkEntry>, 'typedPage'>;
 const openMark = {
   documentId: 'tracker-content/NIM-42', projectId: null, title: null, kind: 'open',
+  typedPage: { itemId: 'NIM-42', typeId: 'bug', issueKey: 'NIM-42' },
   text: 'Pricing is unknown.', plainText: 'Pricing is unknown.', by: 'Spike 6', email: null, on: null, over: null, line: 1, offset: 0,
-} satisfies PageMarkEntry;
+} satisfies Exhaustive<PageMarkEntry>;
 
 // A typed page that underlies NIM-42 (incoming to it), and NIM-42's own link
 // out to a plain page.
@@ -97,7 +103,23 @@ const pageSourcedLink = {
   target: { kind: 'item', ref: 'item-42' }, rel: null, sentence: 'Covers item-42.', count: 1,
 } satisfies PageLinkEntry;
 
+// A page found by its body, and a typed page (no title: the client's tree names it).
+const pageHit = {
+  kind: 'page', id: 'page-1', documentId: 'page-1', title: 'Specs', issueKey: null,
+  snippet: '…the team chose Yjs over Automerge…', highlights: [{ start: 20, end: 23 }], updatedAt: 1790000000000, score: 4.2,
+} satisfies Exhaustive<PageSearchHit>;
+const typedHit = {
+  kind: 'typed', id: 'item-42', documentId: 'tracker-content/item-42', title: null, issueKey: 'NIM-42',
+  snippet: 'Yjs sync for pages.', highlights: [{ start: 0, end: 3 }], updatedAt: null, score: 1.5,
+} satisfies PageSearchHit;
+
 const fixtures: Record<string, unknown> = {
+  'pageSearchQuery.json': {
+    type: 'pageSearchQuery', requestId: 'search-1', projectId: 'project-1', query: 'yjs autom', limit: 20, typeIds: ['module', 'decision'],
+  } satisfies Client<'pageSearchQuery'>,
+  'pageSearchResponse.json': {
+    type: 'pageSearchResponse', requestId: 'search-1', hits: [pageHit, typedHit], status: 'partial',
+  } satisfies Server<'pageSearchResponse'>,
   'pageLinksQuery.json': {
     type: 'pageLinksQuery', requestId: 'links-1', projectId: 'project-1',
     from: { kind: 'item', itemId: 'item-42' }, to: [{ kind: 'item', ref: 'item-42' }, { kind: 'item', ref: 'NIM-42' }],
@@ -107,10 +129,10 @@ const fixtures: Record<string, unknown> = {
   } satisfies Server<'pageLinksResponse'>,
   'pageLinksChanged.json': { type: 'pageLinksChanged' } satisfies Server<'pageLinksChanged'>,
   'pageMarksQuery.json': {
-    type: 'pageMarksQuery', requestId: 'marks-1', kind: 'decided', email: 'greg@example.com', documentIds: ['page-1'],
+    type: 'pageMarksQuery', requestId: 'marks-1', projectId: 'project-1', kind: 'decided', email: 'greg@example.com', documentIds: ['page-1'],
   } satisfies Client<'pageMarksQuery'>,
   'pageMarksResponse.json': {
-    type: 'pageMarksResponse', requestId: 'marks-1', marks: [decidedMark, openMark], status: 'ready',
+    type: 'pageMarksResponse', requestId: 'marks-1', marks: [decidedMark, openMark], status: 'ready', coverage: 'all-page-kinds',
   } satisfies Server<'pageMarksResponse'>,
   'itemPlacementIndexSync.json': { type: 'itemPlacementIndexSync' } satisfies Client<'itemPlacementIndexSync'>,
   'itemPlacementSet.json': {
@@ -142,6 +164,10 @@ const fixtures: Record<string, unknown> = {
   'docIndexRemove.purge.json': {
     type: 'docIndexRemove', documentId: 'page-3', requestId: 'remove-3', purge: true,
   } satisfies Client<'docIndexRemove'>,
+  // A patch: null clears owner, the other keys keep their stored values.
+  'docIndexSetFields.json': {
+    type: 'docIndexSetFields', documentId: 'page-2', fields: { status: 'outdated', owner: null }, requestId: 'fields-1',
+  } satisfies Client<'docIndexSetFields'>,
   'folderRemove.json': { type: 'folderRemove', folderId: 'page-1', requestId: 'remove-2' } satisfies Client<'folderRemove'>,
   // A refused write, answered with the message's requestId.
   'error.requestId.json': {

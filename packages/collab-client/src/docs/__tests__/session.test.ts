@@ -17,11 +17,15 @@ import {
   createCollabDocsSession,
   docReceiptsAtom,
   docUnreadAtom,
+  findOtherProjectDocument,
   getCollabDocsSession,
+  getSharedDocumentsForScopeKey,
   pruneCollabDocsSession,
   setDocUnreadAtom,
   sharedDocumentsAtom,
+  sharedDocumentsForScopeAtom,
   sharedTypePlacementsAtom,
+  trashedSharedDocumentsAtom,
   workspaceHasTeamAtom,
   type CollabDocsCommand,
   type CollabDocsDataChange,
@@ -56,8 +60,26 @@ const UNAVAILABLE_SCOPE: CollabScope = {
   orgId: 'org-session-unavailable',
   indexConfig: { serverUrl: 'ws://sync.test', teamMemberId: asTeamMemberId('member-unavailable') },
 };
+const PRIMARY_PROJECT_SCOPE: CollabScope = {
+  scopeKey: 'session-primary-project-scope',
+  orgId: 'org-session-projects',
+  indexConfig: { serverUrl: 'ws://sync.test', teamProjectId: 'project-a', teamMemberId: asTeamMemberId('member-projects') },
+};
+const SECONDARY_PROJECT_SCOPE: CollabScope = {
+  scopeKey: 'session-secondary-project-scope',
+  orgId: 'org-session-projects',
+  indexConfig: { serverUrl: 'ws://sync.test', teamProjectId: 'project-b', teamMemberId: asTeamMemberId('member-projects') },
+};
+const UNKNOWN_PROJECT_SCOPE: CollabScope = {
+  scopeKey: 'session-unknown-project-scope',
+  orgId: 'org-session-projects',
+  indexConfig: { serverUrl: 'ws://sync.test', teamProjectId: null, teamMemberId: asTeamMemberId('member-projects') },
+};
 const PERSONAL_SCOPE = createPersonalCollabScope('/workspace/session-test');
 const ALL_SCOPE_KEYS = [
+  PRIMARY_PROJECT_SCOPE.scopeKey,
+  SECONDARY_PROJECT_SCOPE.scopeKey,
+  UNKNOWN_PROJECT_SCOPE.scopeKey,
   PERSONAL_SCOPE.scopeKey,
   SCOPE.scopeKey,
   OTHER_SCOPE.scopeKey,
@@ -84,6 +106,7 @@ interface HarnessOptions {
   documents?: SharedDocument[];
   folders?: SharedFolder[];
   typePlacements?: SharedTypePlacement[];
+  primaryProjectId?: string | null;
   personalRows?: CollabPersonalStateRow[];
   receiptRows?: Array<{ entityId: string; lastSeenVersion: number | null; lastViewedAt: number }>;
   setFavorite?: (input: any) => Promise<CollabPersonalStateRow | null>;
@@ -106,6 +129,7 @@ function createHarness(scope: CollabScope, options: HarnessOptions = {}) {
       items: options.documents ?? [],
       containers: options.folders ?? [],
       typePlacements: options.typePlacements,
+      ...(options.primaryProjectId !== undefined ? { primaryProjectId: options.primaryProjectId } : {}),
     })),
     subscribe: vi.fn((listener: (change: CollabDocsDataChange) => void) => {
       dataListener = listener;
@@ -505,6 +529,33 @@ describe('CollabDocsSession', () => {
     expect(harness.commands).toContainEqual(expect.objectContaining({ type: 'trash-document', documentId: 'other' }));
   });
 
+  it('restores a page whose parent is gone to the section root, and says so', async () => {
+    const at = (documentId: string, parentFolderId: string | null, trashedAt: number | null = null) =>
+      ({ ...document(documentId, documentId), parentFolderId, trashedAt });
+    const harness = createHarness(SCOPE);
+    (harness.dataSource.snapshot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      // `notes` sat under a page that is now gone for good; `draft` under one still in Trash.
+      items: [at('notes', 'purged', 7), at('notes-child', 'notes', 7), at('parent', null, 3), at('draft', 'parent', 9), at('live', null)],
+      containers: [],
+      pageTree: true,
+    });
+    await harness.session.start();
+
+    await expect(harness.session.restoreDocument('notes')).resolves.toEqual({ ok: true, restored: 2, movedToRoot: true });
+    await expect(harness.session.restoreDocument('draft')).resolves.toEqual({ ok: true, restored: 1, movedToRoot: true });
+    // The restore lands before the move, so the store never moves a page still in Trash.
+    expect(harness.commands.filter((command) => command.type === 'restore-document' || command.type === 'move-document')
+      .map((command) => `${command.type}:${command.documentId}`))
+      .toEqual(['restore-document:notes', 'restore-document:notes-child', 'move-document:notes', 'restore-document:draft', 'move-document:draft']);
+    expect(harness.commands).toContainEqual(expect.objectContaining({ type: 'move-document', documentId: 'notes', parentFolderId: null }));
+    const restored = harness.session.getDocuments();
+    expect(restored.find((doc) => doc.documentId === 'notes')?.parentFolderId ?? null).toBeNull();
+    expect(restored.find((doc) => doc.documentId === 'notes-child')?.parentFolderId).toBe('notes');
+
+    // A parent that is back in the tree keeps its child.
+    await expect(harness.session.restoreDocument('parent')).resolves.toEqual({ ok: true, restored: 1, movedToRoot: false });
+  });
+
   it('answers a page tree write with the store outcome, not the optimistic state', async () => {
     const harness = createHarness(SCOPE, { documents: [document('arch', 'Architecture'), document('leaf', 'Leaf')] });
     (harness.dataSource.command as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Personal pages refused the write'));
@@ -545,6 +596,23 @@ describe('CollabDocsSession', () => {
 
     await harness.session.removeDocument('leaf');
     expect(leaf()).toMatchObject({ parentFolderId: 'arch' });
+  });
+
+  it('rolls back a refused rename without replacing a newer remote title', async () => {
+    const harness = createHarness(SCOPE, { documents: [document('page', 'Before')] });
+    await harness.session.start();
+    const command = harness.dataSource.command as ReturnType<typeof vi.fn>;
+    command.mockRejectedValueOnce(new Error('rename unconfirmed'));
+    expect(await harness.session.updateDocumentTitle('page', 'After')).toMatchObject({ ok: false });
+    expect(harness.session.getDocuments()[0].title).toBe('Before');
+
+    let reject!: (error: Error) => void;
+    command.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const pending = harness.session.updateDocumentTitle('page', 'After');
+    harness.emitData({ type: 'items-upserted', items: [document('page', 'Teammate title')] });
+    reject(new Error('rename unconfirmed'));
+    await pending;
+    expect(harness.session.getDocuments()[0].title).toBe('Teammate title');
   });
 
   it('does not let the echo of an earlier move revert a later one still in flight', async () => {
@@ -757,5 +825,101 @@ describe('CollabDocsSession', () => {
     store.set(activeCollabScopeAtom, SCOPE);
 
     expect(store.get(docUnreadAtom('doc-pruned'))).toBe(false);
+  });
+});
+
+describe('CollabDocsSession project split', () => {
+  const inProject = (documentId: string, projectId: string | null, extra: Partial<SharedDocument> = {}): SharedDocument =>
+    ({ ...document(documentId, `${documentId} title`), teamProjectId: projectId, ...extra });
+  const ids = (documents: SharedDocument[]) => documents.map((entry) => entry.documentId).sort();
+  const ORG_DOCUMENTS = [
+    inProject('a-page', 'project-a'),
+    inProject('b-page', 'project-b'),
+    inProject('legacy-page', null),
+    inProject('b-trashed', 'project-b', { trashedAt: 50 }),
+    inProject('a-trashed', 'project-a', { trashedAt: 40 }),
+  ];
+
+  it('keeps only the current project in every window list, and a null project means the primary', async () => {
+    const harness = createHarness(PRIMARY_PROJECT_SCOPE, { documents: ORG_DOCUMENTS, primaryProjectId: 'project-a' });
+    await harness.session.start();
+    store.set(activeCollabScopeAtom, PRIMARY_PROJECT_SCOPE);
+
+    expect(ids(harness.session.getDocuments())).toEqual(['a-page', 'legacy-page']);
+    expect(ids(store.get(sharedDocumentsAtom))).toEqual(['a-page', 'legacy-page']);
+    expect(ids(store.get(trashedSharedDocumentsAtom))).toEqual(['a-trashed']);
+    expect(ids(getSharedDocumentsForScopeKey(PRIMARY_PROJECT_SCOPE.scopeKey))).toEqual(['a-page', 'legacy-page']);
+  });
+
+  it("still resolves a link to another project's page", async () => {
+    const harness = createHarness(PRIMARY_PROJECT_SCOPE, { documents: ORG_DOCUMENTS, primaryProjectId: 'project-a' });
+    await harness.session.start();
+
+    const linkable = store.get(sharedDocumentsForScopeAtom(PRIMARY_PROJECT_SCOPE.scopeKey));
+    expect(linkable.find((entry) => entry.documentId === 'b-page')?.title).toBe('b-page title');
+    expect(ids(linkable)).toEqual(['a-page', 'b-page', 'legacy-page']);
+  });
+
+  it('puts the primary project\'s null-project rows outside a secondary project', async () => {
+    const harness = createHarness(SECONDARY_PROJECT_SCOPE, { documents: ORG_DOCUMENTS, primaryProjectId: 'project-a' });
+    await harness.session.start();
+
+    expect(ids(harness.session.getDocuments())).toEqual(['b-page']);
+  });
+
+  it('takes the primary from the snapshot when the scope has no project of its own', async () => {
+    const harness = createHarness(UNKNOWN_PROJECT_SCOPE, { documents: ORG_DOCUMENTS, primaryProjectId: 'project-a' });
+    await harness.session.start();
+
+    expect(ids(harness.session.getDocuments())).toEqual(['a-page', 'legacy-page']);
+  });
+
+  it('routes live upserts and removals to the right list', async () => {
+    const harness = createHarness(PRIMARY_PROJECT_SCOPE, { documents: [], primaryProjectId: 'project-a' });
+    await harness.session.start();
+
+    harness.emitData({ type: 'items-upserted', items: [inProject('b-live', 'project-b'), inProject('a-live', 'project-a')] });
+    expect(ids(harness.session.getDocuments())).toEqual(['a-live']);
+    expect(ids(store.get(sharedDocumentsForScopeAtom(PRIMARY_PROJECT_SCOPE.scopeKey)))).toEqual(['a-live', 'b-live']);
+
+    harness.emitData({ type: 'items-removed', itemIds: ['b-live'] });
+    expect(ids(store.get(sharedDocumentsForScopeAtom(PRIMARY_PROJECT_SCOPE.scopeKey)))).toEqual(['a-live']);
+  });
+
+  it('re-splits the rows it already holds as soon as the primary becomes known', async () => {
+    const harness = createHarness(UNKNOWN_PROJECT_SCOPE, { documents: ORG_DOCUMENTS });
+    await harness.session.start();
+    // No project known yet: nothing is held out of the window.
+    expect(ids(harness.session.getDocuments())).toEqual(['a-page', 'b-page', 'legacy-page']);
+
+    // A snapshot that names the primary but carries no rows (team state before the index).
+    harness.emitData({ type: 'snapshot', snapshot: { items: [], containers: [], primaryProjectId: 'project-a' } });
+    expect(ids(harness.session.getDocuments())).toEqual(['a-page', 'legacy-page']);
+    expect(findOtherProjectDocument(UNKNOWN_PROJECT_SCOPE.scopeKey, 'b-page')).toMatchObject({ projectId: 'project-b' });
+  });
+
+  it("refuses writes to another project's page, or under it, before they reach the data source", async () => {
+    const harness = createHarness(PRIMARY_PROJECT_SCOPE, { documents: ORG_DOCUMENTS, primaryProjectId: 'project-a' });
+    await harness.session.start();
+    const refused = { ok: false, error: expect.stringContaining('another project') };
+
+    expect(await harness.session.updateDocumentTitle('b-page', 'Renamed')).toEqual(refused);
+    expect(await harness.session.removeDocument('b-page')).toEqual(refused);
+    expect(await harness.session.trashDocument('b-page')).toEqual(refused);
+    expect(await harness.session.moveDocument('b-page', null)).toEqual(refused);
+    expect(await harness.session.moveDocument('a-page', 'b-page')).toEqual(refused);
+    expect(await harness.session.removePage('b-page')).toEqual(refused);
+    expect(await harness.session.placeType('module', 'b-page')).toEqual(refused);
+    expect(await harness.session.setItemPlacement('item-1', 'b-page')).toEqual(refused);
+    harness.session.restoreDocument('b-trashed');
+    await expect(harness.session.registerDocument({ documentId: 'b-page', title: 'Clash', documentType: 'markdown', parentFolderId: null }))
+      .rejects.toThrow(/another project/);
+    await expect(harness.session.registerDocument({ documentId: 'new-page', title: 'Child', documentType: 'markdown', parentFolderId: 'b-page' }))
+      .rejects.toThrow(/another project/);
+
+    expect(harness.commands).toEqual([]);
+    expect(ids(harness.session.getDocuments())).toEqual(['a-page', 'legacy-page']);
+    expect(store.get(sharedDocumentsForScopeAtom(PRIMARY_PROJECT_SCOPE.scopeKey)).find((entry) => entry.documentId === 'b-page')?.title)
+      .toBe('b-page title');
   });
 });

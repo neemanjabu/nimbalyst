@@ -10,11 +10,14 @@
  * where the links come from (`linksSource`).
  */
 import React from 'react';
+import type { CollabOpenOptions } from '../../core/index';
 import type { FieldDefinition } from '../../../../tracker-schema/src/browser';
 import type { TrackerRecord } from '../../../../runtime/src/core/TrackerRecord';
-import { TrackerFieldPills } from '../../../../runtime/src/plugins/TrackerPlugin/components/TrackerFieldPills';
+import type { TrackerFieldPills } from '../../../../runtime/src/plugins/TrackerPlugin/components/TrackerFieldPills';
 import type { PageLinksSource } from './pageLinks';
 import type { TrackerPageCrumb } from './trackerPageCrumb';
+import { type PageHeaderMenuItem } from './PageHeaderBar';
+import type { PageTreeAncestor } from '../embed/pageTreeAncestors';
 import './TrackerPageView.css';
 type FieldPillsProps = React.ComponentProps<typeof TrackerFieldPills>;
 export interface TrackerPageViewProps {
@@ -43,7 +46,28 @@ export interface TrackerPageViewProps {
     /** Bumped by the host after a save that may have re-indexed links. */
     linksRevision?: number;
     /** Open another typed page (a Links entry or a relationship chip). */
-    onOpenItem?: (itemId: string) => void;
+    onOpenItem?: (itemId: string, options?: CollabOpenOptions) => void;
+    /** Open the body's page history; absent while the body has none to show. */
+    onShowHistory?: () => void;
+    /**
+     * Archive the typed page through the tracker's archive (after an in-app
+     * confirm). Absent where the host cannot write trackers.
+     */
+    onArchive?: () => void;
+    /**
+     * Draw the page's crumb, History and actions in the document header strip
+     * every tab has, instead of a crumb row above the title. The crumb's pages
+     * open through `onOpenAncestor`.
+     */
+    headerBar?: {
+        onOpenAncestor?: (ancestor: PageTreeAncestor) => void;
+        /** Sync and presence. */
+        status?: React.ReactNode;
+        /** Host buttons before History (table of contents, session chip). */
+        actions?: React.ReactNode;
+        /** Host actions after the page's own (Archive). */
+        menuItems?: readonly PageHeaderMenuItem[];
+    };
 }
 export declare const TrackerPageView: React.FC<TrackerPageViewProps>;
 export {};

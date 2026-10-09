@@ -9,7 +9,8 @@
  * parent column has a `parent_kind` beside it: 'page', or 'item' when the
  * parent is a typed page (a tracker item id); pages carry a `sort_order`.
  */
-import type { SharedDocument, SharedItemPlacement, SharedParentKind, SharedTypePlacement } from '@nimbalyst/collab-client/docs';
+import type { PageFields, SharedDocument, SharedItemPlacement, SharedParentKind, SharedTypePlacement } from '@nimbalyst/collab-client/docs';
+import { applyPageFieldsPatch, normalizePageFields } from '@nimbalyst/collab-client/docs';
 import { toMillis } from '../../utils/timestampUtils';
 
 export interface PersonalPagesDb {
@@ -30,6 +31,7 @@ interface DocumentRow {
   created_at: unknown;
   updated_at: unknown;
   trashed_at: unknown;
+  fields: string | null;
 }
 
 interface PlacementRow {
@@ -58,7 +60,7 @@ const TYPE_PAGE_PREFIX = 'type-page:';
 export async function listDocuments(db: PersonalPagesDb, ws: string): Promise<SharedDocument[]> {
   const { rows } = await db.query<DocumentRow>(
     `SELECT document_id, title, document_type, editor_id, file_extension, metadata_version, parent_folder_id,
-            parent_kind, sort_order, created_at, updated_at, trashed_at
+            parent_kind, sort_order, created_at, updated_at, trashed_at, fields
      FROM personal_page_documents WHERE workspace_path = $1 ORDER BY created_at, document_id`,
     [ws],
   );
@@ -78,7 +80,35 @@ export async function listDocuments(db: PersonalPagesDb, ws: string): Promise<Sh
     parentKind: parentKindOf(row.parent_kind),
     sortOrder: row.sort_order === null || row.sort_order === undefined ? null : Number(row.sort_order),
     trashedAt: toMillis(row.trashed_at),
+    ...pageFieldsOf(row.fields),
   }));
+}
+
+/** The row's stored fields, validated; nothing when none are set or the JSON is bad. */
+function pageFieldsOf(json: string | null): { fields?: PageFields } {
+  if (!json) return {};
+  try {
+    const fields = normalizePageFields(JSON.parse(json));
+    return Object.keys(fields).length > 0 ? { fields } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Applies a fields patch to one page; false when the page is not in this workspace. */
+export async function patchDocumentFields(
+  db: PersonalPagesDb,
+  ws: string,
+  documentId: string,
+  patch: Record<string, unknown>,
+): Promise<boolean> {
+  const { rows } = await db.query<{ fields: string | null }>(
+    'SELECT fields FROM personal_page_documents WHERE workspace_path = $1 AND document_id = $2',
+    [ws, documentId],
+  );
+  if (rows.length === 0) return false;
+  const next = applyPageFieldsPatch(pageFieldsOf(rows[0].fields).fields, patch);
+  return updateDocument(db, ws, documentId, { fields: Object.keys(next).length > 0 ? JSON.stringify(next) : null });
 }
 
 export async function listTypePlacements(db: PersonalPagesDb, ws: string): Promise<SharedTypePlacement[]> {
@@ -252,11 +282,18 @@ export async function deleteItemPlacement(db: PersonalPagesDb, ws: string, itemI
   );
 }
 
-export async function deleteDocument(db: PersonalPagesDb, ws: string, documentId: string): Promise<void> {
-  await db.query(
-    `DELETE FROM personal_page_documents WHERE workspace_path = $1 AND document_id = $2`,
-    [ws, documentId],
+/**
+ * Delete a page for good only while it is still in Trash with the trash time
+ * the caller read: a page another window restored, or restored and trashed
+ * again, since that read is not the page the caller saw and stays. The check
+ * and the delete are one statement. Returns how many pages went (0 or 1).
+ */
+export async function deleteTrashedDocument(db: PersonalPagesDb, ws: string, documentId: string, trashedAt: Date): Promise<number> {
+  const { rows } = await db.query(
+    `DELETE FROM personal_page_documents WHERE workspace_path = $1 AND document_id = $2 AND trashed_at = $3 RETURNING document_id`,
+    [ws, documentId, trashedAt],
   );
+  return rows.length;
 }
 
 export async function deleteTypePlacement(db: PersonalPagesDb, ws: string, typeId: string): Promise<void> {
@@ -267,31 +304,30 @@ export async function deleteTypePlacement(db: PersonalPagesDb, ws: string, typeI
 }
 
 /**
- * Remove a page and every page below it, all or nothing, the way a folder
- * delete worked before pages replaced folders. Types and typed pages placed
- * under a removed page lose their placement (they fall back to root and under
- * their type); no tracker item is touched. A type page's prose goes only when
- * its type is placed inside the subtree; otherwise it is first moved to its
- * type's parent page (or root), never deleted. Membership is computed by each
- * statement inside the transaction, never captured beforehand: a page moved
- * out of the subtree before the transaction takes the write lock is no longer
- * a member and survives. `UNION` (not `UNION ALL`) stops the walk on a corrupt
- * parent cycle. Only page parents count: what sits under a typed page stays
- * with that typed page wherever it now lives.
+ * A page and every page below it, by page parents only: what sits under a typed
+ * page stays with that typed page wherever it now lives. `UNION` (not `UNION
+ * ALL`) stops the walk on a corrupt parent cycle. With `trashedOnly` the root
+ * must still be in Trash with the trash time in `$3`, the one the caller read,
+ * and the walk stays inside Trash, so a live page is never a member. Membership is computed
+ * by each statement inside its transaction, never captured beforehand: a page
+ * moved out of the subtree before the transaction takes the write lock is no
+ * longer a member.
  */
-export async function deletePageSubtree(db: PersonalPagesDb, ws: string, rootPageId: string): Promise<void> {
-  const subtree = `WITH RECURSIVE subtree(document_id) AS (
-      SELECT document_id FROM personal_page_documents WHERE workspace_path = $1 AND document_id = $2
+const pageSubtree = (trashedOnly: boolean) => `WITH RECURSIVE subtree(document_id) AS (
+      SELECT document_id FROM personal_page_documents WHERE workspace_path = $1 AND document_id = $2${trashedOnly ? ' AND trashed_at = $3' : ''}
       UNION
       SELECT d.document_id FROM personal_page_documents d
       JOIN subtree s ON d.parent_folder_id = s.document_id
-      WHERE d.workspace_path = $1 AND d.parent_kind = 'page'
+      WHERE d.workspace_path = $1 AND d.parent_kind = 'page'${trashedOnly ? ' AND d.trashed_at IS NOT NULL' : ''}
     )`;
-  const params = [ws, rootPageId];
-  await db.runTransaction([
-    {
-      // Must run while the type placements still exist.
-      sql: `${subtree} UPDATE personal_page_documents
+
+/**
+ * A type page's prose belongs to its type, not to the page it sits under: when
+ * its type is placed outside the subtree it moves to the type's parent page
+ * (or root) instead of going with the subtree. Must run while the type
+ * placements still exist.
+ */
+const moveOutsideTypeProse = (subtree: string) => `${subtree} UPDATE personal_page_documents
             SET parent_folder_id = (
               SELECT tp.parent_folder_id FROM personal_page_type_placements tp
               WHERE tp.workspace_path = $1 AND '${TYPE_PAGE_PREFIX}' || tp.type_id = personal_page_documents.document_id
@@ -310,7 +346,46 @@ export async function deletePageSubtree(db: PersonalPagesDb, ws: string, rootPag
                 SELECT 1 FROM personal_page_type_placements tp
                 WHERE tp.workspace_path = $1 AND '${TYPE_PAGE_PREFIX}' || tp.type_id = personal_page_documents.document_id
                   AND tp.parent_kind = 'page' AND tp.parent_folder_id IN (SELECT document_id FROM subtree)
-              )`,
+              )`;
+
+/**
+ * Move a page and every page below it to Trash with one trash time, all or
+ * nothing, so restore brings the subtree back together. A page already in
+ * Trash keeps its own time. Placements under the subtree stay: its types and
+ * typed pages show in their usual place meanwhile and are back under it once
+ * it is restored. Nothing is deleted.
+ */
+export async function trashPageSubtree(db: PersonalPagesDb, ws: string, rootPageId: string, trashedAt: Date): Promise<void> {
+  const subtree = pageSubtree(false);
+  await db.runTransaction([
+    { sql: moveOutsideTypeProse(subtree), params: [ws, rootPageId] },
+    {
+      sql: `${subtree} UPDATE personal_page_documents SET trashed_at = $3, updated_at = $3
+            WHERE workspace_path = $1 AND trashed_at IS NULL AND document_id IN (SELECT document_id FROM subtree)`,
+      params: [ws, rootPageId, trashedAt],
+    },
+  ]);
+}
+
+/**
+ * Delete for good a page in Trash and the pages in Trash below it, all or
+ * nothing. Only pages in Trash are members: a live page below one is moved to
+ * the root, never deleted. A root that is no longer in Trash with `trashedAt`
+ * (the time the caller read; another window restored it, or restored and
+ * trashed it again) deletes nothing, because every statement checks it inside
+ * the transaction. Types and typed pages placed under a deleted page lose
+ * their placement (they fall back to root and under their type); no tracker
+ * item is touched.
+ */
+export async function purgeTrashedPageSubtree(db: PersonalPagesDb, ws: string, rootPageId: string, trashedAt: Date): Promise<void> {
+  const subtree = pageSubtree(true);
+  const params = [ws, rootPageId, trashedAt];
+  await db.runTransaction([
+    { sql: moveOutsideTypeProse(subtree), params },
+    {
+      sql: `${subtree} UPDATE personal_page_documents SET parent_folder_id = NULL, parent_kind = 'page'
+            WHERE workspace_path = $1 AND parent_kind = 'page' AND trashed_at IS NULL
+              AND parent_folder_id IN (SELECT document_id FROM subtree)`,
       params,
     },
     {

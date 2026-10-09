@@ -41,7 +41,7 @@ import type {
   DocumentPlacementOptions,
 } from './teamSyncTypes';
 import type { PageParentKind } from '@nimbalyst/collab-protocol';
-import { decodeDocEntry, lockedDocEntry } from './teamDocEntries';
+import { decodeDocEntry, lockedDocEntry, mergeQueuedMessage } from './teamDocEntries';
 import { asTeamMemberId } from '../auth/jwtScopes';
 import type { BoundedPreview } from '@nimbalyst/collab-protocol';
 import { appendSyncClientParams } from './syncClientInfo';
@@ -49,6 +49,7 @@ import { TeamTypePlacementCache, typePlacementQueueKey } from './teamTypePlaceme
 import { TeamItemPlacementCache, itemPlacementQueueKey } from './teamItemPlacements';
 import { TeamPageMarksRequests, type TeamPageMarksFilters, type TeamPageMarksResult } from './teamPageMarks';
 import { TeamPageLinksRequests, type TeamPageLinksFilters, type TeamPageLinksResult } from './teamPageLinks';
+import { PageSearchRequests, type PageSearchRequest, type PageSearchResponse } from '@nimbalyst/collab-protocol';
 
 // ============================================================================
 // TeamSyncProvider
@@ -102,11 +103,15 @@ export class TeamSyncProvider {
   private readonly pageMarkRequests = new TeamPageMarksRequests();
   /** Open `pageLinksQuery` requests. */
   private readonly pageLinkRequests = new TeamPageLinksRequests();
+  private readonly pageSearchRequests = new PageSearchRequests();
 
   /** Set by a snapshot from a TeamRoom whose folders were converted into documents. */
   private pageTree = false;
   /** Set by a snapshot from a TeamRoom that echoes the author's page writes back to it. */
   private authorWriteEcho = false;
+  private authorTitleEcho = false;
+  /** Set by a snapshot from a TeamRoom that stores plain-page fields. */
+  private pageFields = false;
 
   /**
    * Resolvers waiting for a `docIndexRegistered` ack, keyed by document id.
@@ -211,6 +216,7 @@ export class TeamSyncProvider {
     this.itemPlacementEntries.destroy();
     this.pageMarkRequests.cancelAll();
     this.pageLinkRequests.cancelAll();
+    this.pageSearchRequests.cancelAll();
     const registerWaiters = [...this.registerAckWaiters.values()].flat();
     this.registerAckWaiters.clear();
     // Unconfirmed, not confirmed-failed: a destroyed provider says nothing
@@ -316,11 +322,19 @@ export class TeamSyncProvider {
     for (const waiter of waiters) waiter(acked);
   }
 
-  async updateDocumentTitle(documentId: string, newTitle: string): Promise<void> {
+  async updateDocumentTitle(documentId: string, newTitle: string, options: { requestId?: string } = {}): Promise<void> {
     const { encryptedTitle, titleIv } = await this.encodeTitleForWire(newTitle);
     this.send({
-      type: 'docIndexUpdate', documentId, encryptedTitle, titleIv,
+      type: 'docIndexUpdate', documentId, encryptedTitle, titleIv, ...requestIdField(options.requestId),
     });
+  }
+
+  /**
+   * Set some of a plain page's own fields: a patch, null clears a key. Only a
+   * server whose snapshot set `pageFields` takes it (`storesPageFields`).
+   */
+  setDocumentFields(documentId: string, fields: Record<string, unknown>, options: { requestId?: string } = {}): void {
+    this.send({ type: 'docIndexSetFields', documentId, fields, ...requestIdField(options.requestId) });
   }
 
   /** `purge` permanently deletes a page in Trash; only Trash's permanent delete sends it. */
@@ -529,6 +543,15 @@ export class TeamSyncProvider {
     return this.authorWriteEcho;
   }
 
+  echoesTitleWrites(): boolean {
+    return this.authorTitleEcho;
+  }
+
+  /** True once a snapshot said the room stores plain-page fields and echoes their writes. */
+  storesPageFields(): boolean {
+    return this.pageFields;
+  }
+
   /**
    * Place an item (or move its placement). `parentId` is a page id, or an item
    * id with `parentKind: 'item'`; null = root level. The server refuses a
@@ -581,6 +604,21 @@ export class TeamSyncProvider {
       this.send(message);
       return true;
     }, filters, timeoutMs);
+  }
+
+  /**
+   * This connection's project's pages whose bodies match `request`, from the
+   * server's search index (pages this member can read, never trashed ones).
+   * Null while offline, before the project is known, or when unanswered.
+   */
+  searchPages(request: PageSearchRequest, timeoutMs = 8000): Promise<PageSearchResponse | null> {
+    const projectId = this.config.teamProjectId ?? this.teamState?.metadata?.teamProjectId ?? null;
+    if (!projectId) return Promise.resolve(null);
+    return this.pageSearchRequests.request((message) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return false;
+      this.send(message);
+      return true;
+    }, projectId, request, timeoutMs);
   }
 
   // --------------------------------------------------------------------------
@@ -673,6 +711,9 @@ export class TeamSyncProvider {
         case 'pageLinksChanged':
           this.pageLinkRequests.changed();
           break;
+        case 'pageSearchResponse':
+          this.pageSearchRequests.receive(message);
+          break;
         case 'documentCommentNotifyAck':
           // Fire-and-forget: nothing in the client waits on this. Surfacing a
           // fully-suppressed fanout keeps a silently-dropped mention debuggable.
@@ -709,6 +750,8 @@ export class TeamSyncProvider {
     const server: ServerTeamState = msg.team;
     this.pageTree = server.pageTree === true;
     this.authorWriteEcho = server.authorWriteEcho === true;
+    this.authorTitleEcho = server.authorTitleEcho === true;
+    this.pageFields = server.pageFields === true;
 
     // Decrypt document titles. NIM-910: in server-managed mode this teamSync
     // path returns titles RAW (DEK-ciphertext the client cannot read); the
@@ -825,7 +868,7 @@ export class TeamSyncProvider {
   private async handleDocIndexBroadcast(msg: TeamDocIndexBroadcastMessage): Promise<void> {
     let entry: DocIndexEntry;
     try {
-      entry = decodeDocEntry(msg.document);
+      entry = decodeDocEntry(msg.document, this.localEntries.get(msg.document.documentId));
     } catch (err) {
       console.warn(
         '[TeamSync] Title decrypt failed on broadcast; keeping a known title or surfacing as locked:',
@@ -964,7 +1007,7 @@ export class TeamSyncProvider {
     let quietLockedCount = 0;
     for (const e of encrypted) {
       try {
-        results.push(decodeDocEntry(e));
+        results.push(decodeDocEntry(e, this.localEntries.get(e.documentId)));
       } catch (err) {
         // Preserve the entry as a locked placeholder so the user can see
         // that a doc exists and take action (refresh keys, ask admin to
@@ -1027,11 +1070,12 @@ export class TeamSyncProvider {
       return;
     }
     // Collapse a duplicate of the same logical mutation; both queued kinds are
-    // idempotent server-side, so the last one wins.
+    // idempotent server-side, so the last one wins (field patches merge).
+    const previous = this.pendingOfflineMessages.find(pending => this.offlineQueueKey(pending) === key);
     this.pendingOfflineMessages = this.pendingOfflineMessages.filter(
       pending => this.offlineQueueKey(pending) !== key,
     );
-    this.pendingOfflineMessages.push(message);
+    this.pendingOfflineMessages.push(mergeQueuedMessage(previous, message));
     console.warn(`[TeamSync] Queued offline ${message.type} (${this.pendingOfflineMessages.length} pending)`);
   }
 
@@ -1055,7 +1099,8 @@ export class TeamSyncProvider {
   }
 
   private isDocIndexMessage(msg: TeamClientMessage): boolean {
-    return msg.type === 'docIndexRegister' || msg.type === 'docIndexUpdate' || msg.type === 'docIndexRemove'
+    return msg.type === 'docIndexRegister' || msg.type === 'docIndexUpdate' || msg.type === 'docIndexSetFields'
+      || msg.type === 'docIndexRemove'
       || msg.type === 'docTrash' || msg.type === 'docRestore' || msg.type === 'docMove'
       || msg.type === 'folderRegister' || msg.type === 'folderRename'
       || msg.type === 'folderMove' || msg.type === 'folderRemove';

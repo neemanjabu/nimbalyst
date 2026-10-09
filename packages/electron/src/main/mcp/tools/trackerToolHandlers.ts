@@ -1,4 +1,4 @@
-import { globalRegistry } from '@nimbalyst/tracker-schema';
+import { globalRegistry, scopeValidationToChanges } from '@nimbalyst/tracker-schema';
 import type { TrackerItem } from '@nimbalyst/runtime';
 import { getCurrentIdentity } from '../../services/TrackerIdentityService';
 import {
@@ -15,11 +15,13 @@ import { awaitServerIssueKey } from '../../services/tracker/awaitServerIssueKey'
 import { isLocalIssueKey, resolveDisplayIssueKey } from '../../../shared/localIssueKey';
 import { applyHeadlessBodyMarkdown, initializeHeadlessBodyMarkdown } from '../../services/MainBodyDocService';
 import { initialTrackerBodyCache } from '../../services/tracker/trackerBodySnapshot';
+import { recordTypedPageBodySnapshot } from '../../services/tracker/typedPageBodyHistory';
 import { applyRelationshipFieldWrites } from '../../services/tracker/relationshipFieldWrite';
 import { pinCitedRevisions } from '../../services/tracker/citationPins';
 import { appendActivity } from '../../services/tracker/trackerActivity';
 import { pushSharedTrackerItem, sharedTrackerItemTooLarge, trackerItemTooLargeForRoom } from '../../services/tracker/trackerItemShareGate';
 import { assignLocalKeysToRows } from '../../services/tracker/localKeyAllocator';
+import { typeHasLocalNumbers } from '../../services/tracker/localNumberTypes';
 import { workspaceLocalKeyStore } from '../../services/tracker/workspaceLocalKeyStore';
 import { extractItemCustomFields } from '../../services/tracker/trackerRowCustomFields';
 import { nestRelationshipFieldsIntoCustomFields, readStoredFieldValue, writeStoredFieldValue } from '../../services/tracker/relationshipFieldStorage';
@@ -2076,12 +2078,13 @@ export async function handleTrackerCreate(
     })) : null;
     if (tooLarge) return tooLargeToShareToolResult('tracker_create', tooLarge);
     await db.runTransaction(creationStatements);
+    if (descriptionText !== null) await recordTypedPageBodySnapshot(id, args.type, descriptionText);
 
     // Number the row before it is read back, so an agent-created item reports
     // its key in this tool's own result rather than only after the next list
     // sweep. Failure is not fatal -- an unnumbered item still works, and the
     // list will pick it up.
-    if (workspacePath) {
+    if (workspacePath && typeHasLocalNumbers(args.type)) {
       try {
         await assignLocalKeysToRows(db, workspaceLocalKeyStore, workspacePath, [id]);
       } catch (error) {
@@ -2411,7 +2414,10 @@ export async function handleTrackerUpdate(
           }
         }
 
-        const validationResult = globalRegistry.validate(item.type, data);
+        const validationResult = scopeValidationToChanges(
+          globalRegistry.validate(item.type, data),
+          [...Object.keys(changes), ...Object.keys(fileUpdates)],
+        );
         if (!validationResult.valid) {
           return buildTrackerSchemaValidationError('tracker_update', item.type, validationResult.errors);
         }
@@ -2663,7 +2669,13 @@ export async function handleTrackerUpdate(
       }
       await pinCitedRevisions(db, row.workspace, row.id, data, globalRegistry.get(row.type)?.fields ?? []);
 
-      const validationResult = globalRegistry.validate(row.type, data);
+      // A new type's schema applies to every field; otherwise the update answers
+      // only for what it writes, so an item that predates a required field can
+      // still be archived or edited.
+      const wholeItem = globalRegistry.validate(row.type, data);
+      const validationResult = primaryTypeChanged
+        ? wholeItem
+        : scopeValidationToChanges(wholeItem, [...Object.keys(changes), ...explicitlyWrittenFields, ...explicitlyUnsetFields]);
       if (!validationResult.valid) {
         return buildTrackerSchemaValidationError('tracker_update', row.type, validationResult.errors);
       }
@@ -2768,6 +2780,9 @@ export async function handleTrackerUpdate(
           );
         }
         localSnapshotStored = true;
+        // This write bypasses updateTrackerItemContent, which carries the
+        // recorder for every other body save; keep the replaced body too.
+        await recordTypedPageBodySnapshot(row.id, row.type, normalizedContent, { replaced: row.content });
 
         if (workspacePath) {
           try {

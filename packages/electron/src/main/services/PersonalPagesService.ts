@@ -15,8 +15,10 @@
  * must exist in this workspace, and the cycle check walks through typed pages
  * and, for an unplaced one, through its type.
  *
- * Rows are only deleted by `remove-document` and `remove-folder` (a page and
- * its subtree); trash is the default path for a document.
+ * Rows are only deleted by a `purge` of a page already in Trash, as in the team
+ * store: `remove-document` for the page, `remove-folder` for it and the pages
+ * in Trash below it. Without that, both move a live page (and, for
+ * `remove-folder`, its subtree) to Trash; nothing deletes on one call.
  */
 import { BrowserWindow } from 'electron';
 import type {
@@ -28,11 +30,13 @@ import type {
   SharedParentKind,
   SharedTypePlacement,
 } from '@nimbalyst/collab-client/docs';
+import type { PageSearchRequest } from '@nimbalyst/collab-protocol';
 import { getDatabase } from '../database/initialize';
 import { historyManager, type HistoryManager } from '../HistoryManager';
 import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import * as store from './personalPages/personalPagesStore';
+import { searchPersonalPages } from './personalPages/personalPagesSearch';
 import { seedPersonalHomeOnce, workspaceStateHomeSeedFlags, type PersonalHomeSeedFlags } from './personalPages/personalHomePage';
 
 export interface PersonalPagesSnapshot {
@@ -42,6 +46,7 @@ export interface PersonalPagesSnapshot {
   typePlacements: SharedTypePlacement[];
   itemPlacements: SharedItemPlacement[];
   pageTree: true;
+  pageFields: true;
 }
 
 export type PersonalBodyWriteResult =
@@ -77,6 +82,21 @@ function requireId(value: unknown, name: string): string {
 }
 
 const OK: CollabDocsCommandResult = { ok: true };
+
+/** A purge reports how many pages it deleted for good; any other remove is plain OK. */
+const purgeOutcome = (purged: number | null): CollabDocsCommandResult => (purged === null ? OK : { ok: true, purged });
+
+/** A page in Trash and the pages in Trash below it, by page parents, as `purgeTrashedPageSubtree` walks them. */
+function trashedSubtreeIds(documents: SharedDocument[], rootId: string): string[] {
+  const ids = [rootId];
+  for (let index = 0; index < ids.length; index++) {
+    for (const document of documents) {
+      if (document.parentFolderId === ids[index] && (document.parentKind ?? 'page') === 'page'
+        && document.trashedAt != null && !ids.includes(document.documentId)) ids.push(document.documentId);
+    }
+  }
+  return ids;
+}
 
 const kindOf = (value: unknown): SharedParentKind => (value === 'item' ? 'item' : 'page');
 const orderOf = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
@@ -123,7 +143,7 @@ export class PersonalPagesService {
       store.listTypePlacements(db, ws),
       store.listItemPlacements(db, ws),
     ]);
-    return { items, containers: [], typePlacements, itemPlacements, pageTree: true };
+    return { items, containers: [], typePlacements, itemPlacements, pageTree: true, pageFields: true };
   }
 
   async command(workspacePath: string, command: CollabDocsCommand): Promise<CollabDocsCommandResult> {
@@ -152,6 +172,12 @@ export class PersonalPagesService {
       case 'update-document-title':
         await this.mustUpdateDocument(db, ws, command.documentId, { title: command.title ?? '' });
         break;
+      case 'set-document-fields':
+        if (!command.fields || typeof command.fields !== 'object') throw new Error('fields is required');
+        if (!await store.patchDocumentFields(db, ws, requireId(command.documentId, 'documentId'), command.fields)) {
+          throw new Error(`No personal page ${command.documentId}`);
+        }
+        break;
       case 'trash-document':
         await this.mustUpdateDocument(db, ws, command.documentId, {
           trashed_at: new Date(Number.isFinite(command.trashedAt) ? command.trashedAt : Date.now()),
@@ -167,8 +193,7 @@ export class PersonalPagesService {
         );
         break;
       case 'remove-document':
-        await store.deleteDocument(db, ws, requireId(command.documentId, 'documentId'));
-        break;
+        return purgeOutcome(await this.removeDocument(db, ws, requireId(command.documentId, 'documentId'), command.purge === true));
       // Folder commands from a renderer that predates the page tree: a folder
       // is a page with an empty body.
       case 'register-folder': {
@@ -193,8 +218,7 @@ export class PersonalPagesService {
         await this.movePage(db, ws, requireId(command.folderId, 'folderId'), command.parentFolderId ?? null, 'page', null);
         break;
       case 'remove-folder':
-        await store.deletePageSubtree(db, ws, requireId(command.folderId, 'folderId'));
-        break;
+        return purgeOutcome(await this.removePageSubtree(db, ws, requireId(command.folderId, 'folderId'), command.purge === true));
       case 'set-type-placement': {
         const typeId = requireId(command.typeId, 'typeId');
         const parentKind = command.parentFolderId ? kindOf(command.parentKind) : 'page';
@@ -353,6 +377,44 @@ export class PersonalPagesService {
     await this.mustUpdateDocument(db, ws, pageId, { parent_folder_id: parentId, parent_kind: kind, sort_order: sortOrder });
   }
 
+  /**
+   * The team store's rule: a live page goes to Trash, purge or not, and only a
+   * purge of a page already in Trash deletes it. A plain remove of a page in
+   * Trash (a replayed or stale write) changes nothing. With `purge`, returns
+   * how many pages went; 0 when another window restored the page since it was
+   * read here (the delete re-checks that inside its own statement).
+   */
+  private async removeDocument(db: store.PersonalPagesDb, ws: string, documentId: string, purge: boolean): Promise<number | null> {
+    const document = (await store.listDocuments(db, ws)).find((candidate) => candidate.documentId === documentId);
+    if (document?.trashedAt == null) {
+      if (document) await this.mustUpdateDocument(db, ws, documentId, { trashed_at: new Date() });
+      return purge ? 0 : null;
+    }
+    return purge ? store.deleteTrashedDocument(db, ws, documentId, new Date(document.trashedAt)) : null;
+  }
+
+  /**
+   * `remove-folder`, from a renderer that predates the page tree, under the
+   * same rule: a live page goes to Trash with its subtree, and only a purge of
+   * a page already in Trash deletes it, with the pages in Trash below it. With
+   * `purge`, returns how many pages went; 0 when another window restored the
+   * page since it was read here (the transaction re-checks that).
+   */
+  private async removePageSubtree(db: store.PersonalPagesDb, ws: string, pageId: string, purge: boolean): Promise<number | null> {
+    const documents = await store.listDocuments(db, ws);
+    const page = documents.find((candidate) => candidate.documentId === pageId);
+    if (page?.trashedAt == null) {
+      if (page) await store.trashPageSubtree(db, ws, pageId, new Date());
+      return purge ? 0 : null;
+    }
+    if (!purge) return null;
+    const candidates = trashedSubtreeIds(documents, pageId);
+    await store.purgeTrashedPageSubtree(db, ws, pageId, new Date(page.trashedAt));
+    // Counted, not assumed: the transaction may have found the page restored.
+    const remaining = new Set((await store.listDocuments(db, ws)).map((document) => document.documentId));
+    return candidates.filter((id) => !remaining.has(id)).length;
+  }
+
   private async mustUpdateDocument(db: store.PersonalPagesDb, ws: string, documentId: string, values: Record<string, unknown>) {
     if (!(await store.updateDocument(db, ws, requireId(documentId, 'documentId'), values))) {
       throw new Error(`Unknown personal document '${documentId}'`);
@@ -371,6 +433,11 @@ export function initPersonalPagesService(): void {
   });
   safeHandle('personal-pages:command', async (_event, workspacePath: string, command: CollabDocsCommand) => {
     return instance.command(workspacePath, command);
+  });
+  safeHandle('personal-pages:search', async (_event, workspacePath: string, request: PageSearchRequest) => {
+    const db = getDatabase();
+    if (!db) throw new Error('Database not initialized');
+    return searchPersonalPages(db, requireWorkspace(workspacePath), request ?? { query: '' });
   });
   safeHandle('personal-pages:get-body', async (_event, workspacePath: string, documentId: string) => {
     return instance.getBody(workspacePath, documentId);

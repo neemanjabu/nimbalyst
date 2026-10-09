@@ -2,7 +2,7 @@
  * Agent tools for the one page tree (Pages mode), for the Team and the
  * Personal section alike: list the tree, create a page under a page or a typed
  * page, move or reorder pages, typed pages and placed types, rename, delete,
- * and Set type.
+ * Set type, and a plain page's own fields.
  *
  * Every structural write goes through the same planner the sidebar's drag and
  * drop uses (`collabPageTree`), so an agent gets the same cycle refusals
@@ -17,11 +17,23 @@
  * session's Jotai-held type placements are read through the env.
  */
 import {
+  applyPageFieldsPatch,
   buildConsoleLink,
+  normalizePageFields,
+  pageSearchMatches,
+  pageSearchQueryTerms,
   type ConsoleLinkScope,
   type ListPagesResult,
+  type PageFields,
   type PageTreeNodeSummary,
+  type SearchPagesResult,
+  type SearchPagesResultEntry,
 } from '@nimbalyst/collab-protocol';
+import { mergePageSearchHits, nameTypedHits, pageSearchTitleHits } from './pageSearch';
+import { pageTreeListing } from './pageTreeListing';
+
+// For a worker session's `searchPages`; `pageSearch.ts` has no package entry of its own.
+export { searchSectionPages } from './pageSearch';
 import {
   isTypePageDocumentId,
   pageDisplayName,
@@ -107,7 +119,6 @@ async function readTree(env: PageTreeToolEnv, section: PageTreeSection): Promise
     resolver,
     typePlacements: env.typePlacements(session),
     itemPlacements: session.getItemPlacements(),
-    currentProjectId: session.scope.indexConfig?.teamProjectId ?? null,
   });
   const nodes = new Map<string, CollabTreeNode>();
   const parents = new Map<string, CollabTreeNode | null>();
@@ -219,19 +230,29 @@ function consoleScopeOf(context: TreeContext): ConsoleLinkScope | null {
   return projectId ? { orgId: context.session.scope.orgId, projectId } : null;
 }
 
+function pageFieldsOf(document: SharedDocument): { fields?: PageFields } {
+  const fields = normalizePageFields(document.fields);
+  return Object.keys(fields).length > 0 ? { fields } : {};
+}
+
 function describeNode(context: TreeContext, env: PageTreeToolEnv, node: CollabTreeNode, depth: number): PageTreeNodeSummary | null {
   const parentNodeId = context.parents.get(node.id)?.id ?? null;
   const scope = consoleScopeOf(context);
+  const childCount = childrenOf(node).length;
   if (node.type === 'document') {
     return {
       nodeId: node.id,
       kind: 'page',
+      childCount,
+      updatedAt: node.document.updatedAt,
+      ...(node.document.hasContent !== undefined ? { hasContent: node.document.hasContent } : {}),
       id: node.document.documentId,
       title: pageDisplayName(node.document.title, node.document.documentType),
       parentNodeId,
       depth,
       sortOrder: node.document.sortOrder ?? null,
       uri: env.pageUri(context.section, node.document.documentId),
+      ...pageFieldsOf(node.document),
       ...(scope ? { link: buildConsoleLink({ kind: 'page', scope, pageId: node.document.documentId }) } : {}),
     };
   }
@@ -240,6 +261,7 @@ function describeNode(context: TreeContext, env: PageTreeToolEnv, node: CollabTr
     return {
       nodeId: node.id,
       kind: 'typedPage',
+      childCount,
       id: node.itemId,
       ...(item?.issueKey ? { issueKey: item.issueKey } : {}),
       typeId: node.typeId,
@@ -255,6 +277,7 @@ function describeNode(context: TreeContext, env: PageTreeToolEnv, node: CollabTr
     return {
       nodeId: node.id,
       kind: 'type',
+      childCount,
       id: node.typeId,
       title: node.name,
       parentNodeId,
@@ -269,8 +292,8 @@ function describeNode(context: TreeContext, env: PageTreeToolEnv, node: CollabTr
   return null;
 }
 
-export async function listPagesTool(env: PageTreeToolEnv, args: Record<string, unknown>): Promise<PageTreeToolResult> {
-  const context = await readTree(env, sectionOf(args.section));
+/** Internal complete tree, also used by search so public pagination cannot hide hits. */
+function describeTree(context: TreeContext, env: PageTreeToolEnv): PageTreeNodeSummary[] {
   const nodes: PageTreeNodeSummary[] = [];
   const walk = (list: CollabTreeNode[], depth: number) => {
     for (const node of list) {
@@ -280,12 +303,27 @@ export async function listPagesTool(env: PageTreeToolEnv, args: Record<string, u
     }
   };
   walk(context.tree, 0);
+  return nodes;
+}
+
+export async function listPagesTool(env: PageTreeToolEnv, args: Record<string, unknown>): Promise<PageTreeToolResult> {
+  const context = await readTree(env, sectionOf(args.section));
+  let root: string | null = null;
+  if (args.root !== undefined) {
+    if (typeof args.root !== 'string' || !(root = resolveNodeRef(env, context, args.root))) return fail('No such subtree in this Wiki section.');
+  }
+  let listing;
+  try {
+    listing = await pageTreeListing(describeTree(context, env), JSON.stringify([context.section, consoleScopeOf(context)]), args, root);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : 'Could not list pages.');
+  }
   const scope = consoleScopeOf(context);
   const result: ListPagesResult = {
     section: context.section,
     consoleScope: scope,
     ...(scope ? { openMarksViewLink: buildConsoleLink({ kind: 'view', scope, view: { kind: 'marks', marks: 'open' } }) } : {}),
-    nodes,
+    ...listing,
   };
   return { success: true, ...result };
 }
@@ -441,6 +479,26 @@ export async function renamePageTool(env: PageTreeToolEnv, args: Record<string, 
   return settled(context.session.updateDocumentTitle(id, newName), 'rename');
 }
 
+/**
+ * `setPageFields`: a patch of a plain page's own fields. The answer is the
+ * fields the page has after the write, so an agent sees a value that did not
+ * validate (and was ignored) without listing the tree again.
+ */
+export async function setPageFieldsTool(env: PageTreeToolEnv, args: Record<string, unknown>): Promise<PageTreeToolResult> {
+  const id = typeof args.itemId === 'string' ? args.itemId : '';
+  const patch = args.fields && typeof args.fields === 'object' && !Array.isArray(args.fields)
+    ? args.fields as Record<string, unknown>
+    : null;
+  if (!id || !patch) return fail('setPageFields needs itemId and a fields object.');
+  const context = await readTree(env, sectionOf(args.section));
+  const page = findPage(context, id);
+  if (!page || isTypePageDocumentId(id)) return fail(`No plain page "${id}" in the ${context.section} section. Set a typed page's fields with tracker_update.`);
+  if (!context.session.updateDocumentFields) return fail(`The ${context.section} section cannot store page fields.`);
+  const result = await settled(context.session.updateDocumentFields(id, patch), 'field change');
+  // Every store applies the patch with the same function, so this is what it kept.
+  return result.success ? { success: true, fields: applyPageFieldsPatch(page.fields, patch) } : result;
+}
+
 export async function deletePageTool(env: PageTreeToolEnv, args: Record<string, unknown>): Promise<PageTreeToolResult> {
   const id = typeof args.itemId === 'string' ? args.itemId : '';
   if (!id) return fail('Delete needs itemId.');
@@ -471,4 +529,68 @@ export async function setPageTypeTool(env: PageTreeToolEnv, args: Record<string,
   const outcome = await env.setPageType(context.section, context.session, page, typeId);
   if (outcome.status === 'done') return { success: true, ...(outcome.itemId ? { itemId: outcome.itemId } : {}) };
   return fail(`${outcome.status === 'refused' ? 'Set type refused' : 'Set type did not finish'}: ${outcome.message ?? 'no reason given'}`);
+}
+
+/**
+ * `searchPages`: body hits from the section session's `searchPages` (the Team
+ * server index, or the local Personal store), page and type-page titles
+ * included; typed pages named and title-matched from the listed tree, which
+ * also drops a typed hit the tree does not show (archived). Each result has
+ * the uri to read with readCollabDoc and the link to write, as listPages
+ * gives them.
+ */
+export async function searchPagesTool(env: PageTreeToolEnv, args: Record<string, unknown>): Promise<PageTreeToolResult> {
+  const query = typeof args.query === 'string' ? args.query.trim() : '';
+  if (!query) return { success: false, error: 'searchPages needs the words to find in `query`.' };
+  if (pageSearchQueryTerms(query).terms.length === 0) {
+    return { success: false, error: 'searchPages matches words of two or more letters or digits; `query` has none.' };
+  }
+  const section: PageTreeSection = args.section === 'personal' ? 'personal' : 'team';
+  const limit = typeof args.limit === 'number' ? args.limit : undefined;
+
+  const context = await readTree(env, section);
+  const nodes = describeTree(context, env);
+  const session = context.session;
+  if (!session.searchPages) return { success: false, error: 'This Wiki section cannot search page text.' };
+  // Only the types the tree shows: a typed page it would drop must not use up the limit.
+  const typeIds = [...new Set(nodes.flatMap((node) => (node.kind === 'typedPage' ? [node.typeId] : [])))];
+  const found = await session.searchPages({ query, limit, typeIds });
+  if (!found) return { success: false, error: 'Search is unavailable right now (the section is offline or still connecting). Try again shortly.' };
+
+  const byKind = (kind: PageTreeNodeSummary['kind']) => new Map(nodes.filter((node) => node.kind === kind).map((node) => [node.id, node]));
+  const pages = byKind('page');
+  const types = byKind('type');
+  const typed = byKind('typedPage') as Map<string, Extract<PageTreeNodeSummary, { kind: 'typedPage' }>>;
+
+  const named = nameTypedHits(found.hits, (itemId) => {
+    const node = typed.get(itemId);
+    return node ? { title: node.title, issueKey: node.issueKey ?? null } : null;
+  });
+  const typedTitles = pageSearchTitleHits(query, [...typed.values()].map((node) => ({
+    documentId: `tracker-content/${node.id}`, title: node.title, issueKey: node.issueKey ?? null,
+  })));
+  const hits = mergePageSearchHits(named, typedTitles, limit);
+
+  const parsed = pageSearchQueryTerms(query);
+  const results: SearchPagesResultEntry[] = hits.map((hit) => {
+    const node = hit.kind === 'page' ? pages.get(hit.id) : hit.kind === 'typePage' ? types.get(hit.id) : typed.get(hit.id);
+    const title = hit.title ?? node?.title ?? hit.id;
+    const inTitle = pageSearchMatches(title, parsed);
+    const uri = hit.kind === 'page' && node?.kind === 'page'
+      ? node.uri
+      : section === 'team' && hit.kind === 'typed' ? `collab://${hit.documentId}` : env.pageUri(section, hit.documentId);
+    return {
+      kind: hit.kind === 'typed' ? 'typedPage' : hit.kind === 'typePage' ? 'type' : 'page',
+      id: hit.id,
+      title,
+      ...(hit.issueKey ? { issueKey: hit.issueKey } : {}),
+      uri,
+      ...(node?.link ? { link: node.link } : {}),
+      snippet: hit.snippet,
+      matchedIn: !hit.snippet ? 'title' : inTitle ? 'both' : 'body',
+      updatedAt: hit.updatedAt,
+    };
+  });
+  const result: SearchPagesResult = { section, query, status: found.status, results };
+  return { success: true, ...result };
 }

@@ -11,7 +11,7 @@
 import React, { useCallback, useState, useEffect, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { setTitleBarCreateMenuAtom } from '../../store/atoms/titleBarCreate';
-import { CollabScopeResolutionError, type CollabScope } from '@nimbalyst/collab-client/core';
+import { CollabScopeResolutionError, type CollabOpenOptions, type CollabScope } from '@nimbalyst/collab-client/core';
 import { createCollabDocsScopeLifecycle, pageDisplayName } from '@nimbalyst/collab-client/docs';
 import { store } from '@nimbalyst/runtime/store';
 import type { CollabSidebarCreateMenu } from '@nimbalyst/collab-client/docs-ui';
@@ -26,6 +26,7 @@ import {
   type TabData,
 } from '../../contexts/TabsContext';
 import { TabManager } from '../TabManager/TabManager';
+import { TrackerTabIssueKeyContext } from '../TabManager/trackerTabIssueKey';
 import { TabContent } from '../TabContent/TabContent';
 import type { DocumentSessionActions } from '../TabEditor/DocumentSessionControl';
 import { ChatSidebar, type ChatSidebarRef } from '../ChatSidebar';
@@ -39,16 +40,23 @@ import {
 } from '../../utils/collabDocumentOpener';
 import { activePageRow, openPageTab } from './collabPageTabs';
 import { composePagesCreateMenu } from './pagesCreateMenu';
+import { PagesTabHistoryButtons, usePagesTabNavigation } from './usePagesTabNavigation';
+import { PagesSwipeNavigation } from './PagesSwipeNavigation';
 import { useCollabTabPersistence } from './useCollabTabPersistence';
+import { useLocalWikiFileTabs } from './useLocalWikiFileTabs';
 import { usePublishPagesTabStrip } from '../../services/pageTreeTools/pagesTabStrip';
-import { PagesSidebarSections } from './PagesSidebarSections';
+import { PagesSidebarSections, useSectionHomeId } from './PagesSidebarSections';
+import { pageHeaderRequestPendingAtom } from './pageTypeRequest';
+import type { PagesSectionLane, PagesSectionView } from './pagesSectionTabs';
 import {
   initSharedDocuments,
+  getElectronCollabDocsSession,
   getElectronCollabHost,
   getElectronCollabHostForScopeKey,
   getPersonalCollabDocsSession,
   getPersonalCollabHost,
-  getSharedDocumentsForScope,
+  getLinkableSharedDocumentsForScopeKey,
+  linkableSharedDocumentsAtom,
   pendingCollabDocumentAtom,
   rebindElectronCollabHostScope,
   sharedDocumentsAtom,
@@ -56,7 +64,6 @@ import {
   type SharedDocument,
 } from '../../store/atoms/collabDocuments';
 import { changedDocIdsAtom } from '../../store/atoms/collabDiscovery';
-import { SHARED_HOME_TAB_URI, SHARED_HOME_TAB_TITLE, isSharedHomeTab } from './sharedHomeTab';
 import { isCollabUri, parseCollabUri } from '@nimbalyst/collab-protocol';
 import {
   getSharedDocumentDisplayName,
@@ -237,8 +244,14 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
   usePublishPagesTabStrip(workspacePath, tabsActions);
   const { tabs, activeTabId } = useTabs();
   useTabNavigationShortcuts(isActive);
+  // A click opens in the current tab (Cmd/Ctrl: a new one); each tab keeps Back/Forward.
+  const { addTabFor, step: stepPagesHistory } = usePagesTabNavigation(isActive, workspacePath);
+  const tabContentAreaRef = useRef<HTMLDivElement>(null);
   const pendingDoc = useAtomValue(pendingCollabDocumentAtom);
   const sharedDocuments = useAtomValue(sharedDocumentsAtom);
+  // Opening and naming an existing link also finds other projects' pages,
+  // which the window's lists leave out.
+  const linkableDocuments = useAtomValue(linkableSharedDocumentsAtom);
   const sharedFolders = useAtomValue(sharedFoldersAtom);
   const unreadDocumentIds = useAtomValue(changedDocIdsAtom);
 
@@ -259,10 +272,12 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     personal: CollabSidebarCreateMenu | null;
   }>({ team: null, personal: null });
   const publishCreateMenu = useCallback(() => {
-    const menu = composePagesCreateMenu(createMenusRef.current.team, createMenusRef.current.personal);
+    const menu = composePagesCreateMenu(createMenusRef.current.team, createMenusRef.current.personal, (section) => {
+      void import('../../services/addFileToPages').then(({ addFileToPages }) => addFileToPages({ section, parentId: null, workspacePath }));
+    });
     createPrimaryRef.current = menu?.onPrimary ?? null;
     setTitleBarCreateMenu('collab', menu);
-  }, [setTitleBarCreateMenu]);
+  }, [setTitleBarCreateMenu, workspacePath]);
   const registerTeamCreateMenu = useCallback((menu: CollabSidebarCreateMenu | null) => {
     createMenusRef.current.team = menu;
     publishCreateMenu();
@@ -276,11 +291,11 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     onPanelStateChange?.({ sidebarCollapsed, chatCollapsed });
   }, [sidebarCollapsed, chatCollapsed, onPanelStateChange]);
 
-  // The Shared Docs Home is a singleton virtual tab (NIM-1790). Opening it
-  // dedupes by URI, so this focuses the existing tab if present.
-  const openSharedHomeTab = useCallback((switchToTab = true) => {
-    tabsActions.addTab(SHARED_HOME_TAB_URI, '', switchToTab, SHARED_HOME_TAB_TITLE);
-  }, [tabsActions]);
+  // A section's Search and Types are one tab each: opening one that is open
+  // focuses it, otherwise it lands per the click (`addTabFor`).
+  const openSectionView = useCallback((view: PagesSectionView, lane: PagesSectionLane, options?: CollabOpenOptions) => {
+    openPageTab(addTabFor(options), { kind: view, artifactId: lane });
+  }, [addTabFor]);
 
   // Refs for sidebar resize drag (avoids re-renders during drag)
   const sidebarDragRef = useRef({ startX: 0, startWidth: 0, latestWidth: sidebarWidth });
@@ -439,6 +454,12 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     });
   }, [workspacePath, sidebarWidth, chatWidth, sidebarCollapsed]);
 
+  // A page header's Set type, Move, Rename or Trash is answered by the sidebar, so it opens to run them.
+  const headerRequestPending = useAtomValue(pageHeaderRequestPendingAtom);
+  useEffect(() => {
+    if (headerRequestPending && sidebarCollapsed) toggleSidebarCollapsed();
+  }, [headerRequestPending, sidebarCollapsed, toggleSidebarCollapsed]);
+
   // Double-click a tab to maximize the editor (collapse doc list + AI chat).
   // Second double-click restores the exact prior collapse state.
   const { isMaximized: isEditorMaximized, toggle: toggleEditorMaximized, clearMaximize: clearEditorMaximized } =
@@ -469,10 +490,13 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     doc: SharedDocument,
     initialContent?: string,
     analyticsSource: CollabDocumentOpenSource = 'sidebar',
+    openOptions?: CollabOpenOptions,
   ) => {
     if (!teamScope) return;
-    // Check if already open as a tab
-    const existingTab = tabs.find((tab) => {
+    // Check if already open as a tab. A plain click navigates the current tab
+    // even when another tab shows the page, so only the current tab counts.
+    const candidates = openOptions && !openOptions.newTab ? tabs.filter((tab) => tab.id === activeTabId) : tabs;
+    const existingTab = candidates.find((tab) => {
       if (!isCollabUri(tab.filePath)) return false;
       try {
         return parseCollabUri(tab.filePath).documentId === doc.documentId;
@@ -521,7 +545,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         analyticsActorType: analyticsSource === 'agent_tool' ? 'agent' : 'user',
         analyticsWasUnread: unreadDocumentIds.has(doc.documentId),
         initialContent,
-        addTab: tabsActions.addTab,
+        addTab: addTabFor(openOptions),
       });
       const nextName = pageDisplayName(getSharedDocumentDisplayName(doc.title, doc.documentId), doc.documentType);
       if (tabsActions.getTabState(tabId)?.fileName !== nextName) {
@@ -548,35 +572,35 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         { details: doc.title || doc.documentId }
       );
     }
-  }, [teamScope, tabs, tabsActions, sharedFolders, unreadDocumentIds]);
+  }, [teamScope, tabs, activeTabId, tabsActions, addTabFor, sharedFolders, unreadDocumentIds]);
 
-  useEffect(() => teamScope ? getElectronCollabHost(teamScope).setOpenArtifactAdapter((ref, source) => {
+  useEffect(() => teamScope ? getElectronCollabHost(teamScope).setOpenArtifactAdapter((ref, source, options) => {
     if (ref.scope.scopeKey !== teamScope.scopeKey) return;
     // Items and types open as pages here; they never hand off to Tracker mode.
     if (ref.kind === 'tracker') {
-      openPageTab(tabsActions.addTab, { kind: 'tracker', artifactId: ref.trackerId });
+      openPageTab(addTabFor(options), { kind: 'tracker', artifactId: ref.trackerId });
       return;
     }
     if (ref.kind === 'type') {
-      openPageTab(tabsActions.addTab, { kind: 'type', artifactId: ref.typeId });
+      openPageTab(addTabFor(options), { kind: 'type', artifactId: ref.typeId });
       return;
     }
     if (ref.kind !== 'document') return;
-    const document = sharedDocuments.find((item) => item.documentId === ref.documentId);
-    if (document) void handleDocumentSelect(document, undefined, source);
-  }) : undefined, [teamScope, sharedDocuments, handleDocumentSelect, tabsActions]);
+    const document = linkableDocuments.find((item) => item.documentId === ref.documentId);
+    if (document) void handleDocumentSelect(document, undefined, source, options);
+  }) : undefined, [teamScope, linkableDocuments, handleDocumentSelect, addTabFor]);
 
-  // Personal pages open as `personal://` tabs; their items and types open as
-  // pages, the same as the team's.
-  useEffect(() => getPersonalCollabHost(workspacePath).setOpenArtifactAdapter((target) => {
-    if (target.kind === 'personal-page') {
-      tabsActions.addTab(target.path, '', true, target.title);
+  // Local pages open as their markdown files, database pages not exported yet
+  // as `personal://` tabs; items and types open as pages, the same as the team's.
+  useEffect(() => getPersonalCollabHost(workspacePath).setOpenArtifactAdapter((target, _source, options) => {
+    if (target.kind === 'personal-page' || target.kind === 'local-file') {
+      addTabFor(options)(target.path, '', true, target.title);
       return;
     }
-    openPageTab(tabsActions.addTab, target.kind === 'tracker'
+    openPageTab(addTabFor(options), target.kind === 'tracker'
       ? { kind: 'tracker', artifactId: target.trackerId }
       : { kind: 'type', artifactId: target.typeId });
-  }), [workspacePath, tabsActions]);
+  }), [workspacePath, addTabFor]);
 
   // Keep personal page tab titles in step with renames in the tree.
   const personalDocuments = useAtomValue(getPersonalCollabDocsSession(workspacePath).atoms.sharedDocuments);
@@ -591,11 +615,12 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
       if (title && tab.fileName !== title) tabsActions.updateTab(tab.id, { fileName: title });
     }
   }, [personalDocuments, tabs, tabsActions]);
+  useLocalWikiFileTabs(workspacePath, personalDocuments, tabs, tabsActions);
 
   // Relationship clicks on an item page, and row clicks on a type page.
-  const handleOpenTrackerPage = useCallback((trackerItemId: string) => {
-    openPageTab(tabsActions.addTab, { kind: 'tracker', artifactId: trackerItemId });
-  }, [tabsActions]);
+  const handleOpenTrackerPage = useCallback((trackerItemId: string, options?: CollabOpenOptions) => {
+    openPageTab(addTabFor(options), { kind: 'tracker', artifactId: trackerItemId });
+  }, [addTabFor]);
 
   const activeTabPath = activeTabId ? tabs.find(tab => tab.id === activeTabId)?.filePath ?? null : null;
   const activeCollabDocumentId = useMemo(() => {
@@ -608,7 +633,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
   }, [activeTabPath]);
   const activePersonalDocumentId = activeTabPath && isPersonalPageTabPath(activeTabPath)
     ? activeTabPath.slice(PERSONAL_PAGE_TAB_PREFIX.length)
-    : null;
+    : activeTabPath ? getPersonalCollabHost(workspacePath).source().documentIdForFile(activeTabPath) : null;
   const activeRow = useMemo(() => activePageRow(activeTabPath), [activeTabPath]);
 
   useEffect(() => {
@@ -623,7 +648,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         continue;
       }
 
-      const document = sharedDocuments.find(doc => doc.documentId === documentId);
+      const document = linkableDocuments.find(doc => doc.documentId === documentId);
       if (!document) continue;
 
       const nextName = reconcileSharedDocumentDisplayName(
@@ -643,7 +668,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         tabsActions.updateTab(tab.id, { fileName: nextName });
       }
     }
-  }, [teamScope, sharedDocuments, sharedFolders, tabs, tabsActions]);
+  }, [teamScope, linkableDocuments, sharedFolders, tabs, tabsActions]);
 
   const restored = useCollabTabPersistence({
     workspacePath,
@@ -668,7 +693,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
       || pendingDoc.orgId !== teamScope.orgId
     ) return;
 
-    const docs = getSharedDocumentsForScope(teamScope);
+    const docs = getLinkableSharedDocumentsForScopeKey(teamScope.scopeKey);
     const found = docs.find(d => d.documentId === pendingDoc.documentId);
 
     // Prefer the synced doc (it has the canonical title), but fall back to
@@ -697,42 +722,30 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         };
 
     store.set(pendingCollabDocumentAtom, null);
-    handleDocumentSelect(docToOpen, pendingDoc.initialContent, pendingDoc.analyticsSource ?? 'deep_link');
+    handleDocumentSelect(docToOpen, pendingDoc.initialContent, pendingDoc.analyticsSource ?? 'deep_link', pendingDoc.openOptions);
   }, [pendingDoc, isActive, handleDocumentSelect, teamScope]);
 
-  // Ensure the singleton Shared Docs Home tab exists once restore settles, so
-  // the shared area always lands on the list-view home (replaces the old
-  // empty-state card hub). Switch to it only when nothing else is open. The
-  // home lists team documents, so it waits for the team scope.
+  // With nothing open once restore settles, Pages lands on a Home page: the
+  // team's with a team (waiting for it to sync), else Personal's. Closing the
+  // last tab lands on the team's Home again, so the team area is never blank.
+  const teamHomeId = useSectionHomeId(teamScope, teamScope ? getElectronCollabDocsSession(teamScope) : null);
+  const personalHomeId = useSectionHomeId(null, getPersonalCollabDocsSession(workspacePath));
+  const landedRef = useRef(false);
   useEffect(() => {
-    if (!restored || !teamScope) return;
-    const snapshot = tabsActions.getSnapshot();
-    const hasHome = Array.from(snapshot.tabs.values()).some((t) => isSharedHomeTab(t.filePath));
-    if (!hasHome) {
-      openSharedHomeTab(snapshot.tabs.size === 0);
-    }
-  }, [restored, teamScope, openSharedHomeTab, tabsActions]);
-
-  // Reopen the home tab if the user closes the last remaining tab, so the
-  // shared area never falls back to a blank pane.
-  useEffect(() => {
-    if (!restored || !teamScope) return;
-    if (tabs.length === 0) {
-      openSharedHomeTab(true);
-    }
-  }, [restored, teamScope, tabs.length, openSharedHomeTab]);
-
-  const activeTabIsHome = useMemo(() => {
-    if (!activeTabId) return false;
-    const tab = tabs.find((t) => t.id === activeTabId);
-    return tab ? isSharedHomeTab(tab.filePath) : false;
-  }, [activeTabId, tabs]);
+    if (!restored || tabs.length > 0 || (landedRef.current && !teamScope)) return;
+    if (teamScope ? !teamHomeId : !personalHomeId) return;
+    landedRef.current = true;
+    const [host, scope, documentId] = teamScope
+      ? [getElectronCollabHost(teamScope), teamScope, teamHomeId!]
+      : [getPersonalCollabHost(workspacePath), personalScope, personalHomeId!];
+    host.openArtifact({ kind: 'document', scope, documentId, teamProjectId: scope.indexConfig.teamProjectId ?? null }, 'sidebar');
+  }, [restored, tabs.length, teamScope, teamHomeId, personalHomeId, workspacePath, personalScope]);
 
   // File path of the active collab document, so the chat panel scopes its
   // "+ selection" chips to the doc the user is actually looking at. Without a
   // currentFilePath the chip row falls back to "most recent" and leaks a stale
   // selection from a previously-active tab (e.g. a spreadsheet's cells still
-  // showing after switching to a markdown doc). Empty for the Shared Docs Home.
+  // showing after switching to a markdown doc). Empty for Search and Types.
   const activeCollabFilePath = useMemo(() => {
     if (!activeTabId) return '';
     const tab = tabs.find((t) => t.id === activeTabId);
@@ -815,8 +828,8 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
               activeTeamDocumentId={activeCollabDocumentId}
               activePersonalDocumentId={activePersonalDocumentId}
               activeRow={activeRow}
-              onShowHome={() => openSharedHomeTab(true)}
-              homeActive={activeTabIsHome}
+              activeTabPath={activeTabPath}
+              onOpenSectionView={openSectionView}
               registerTeamCreateMenu={registerTeamCreateMenu}
               registerPersonalCreateMenu={registerPersonalCreateMenu}
             />
@@ -836,10 +849,11 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
         </>
       )}
 
-      {/* Center: Tabs + editor. With a team the Shared Docs Home is itself a
-          (singleton) tab, so the tab strip is always present; without one an
-          empty Personal section shows a hint instead. */}
-      <div className="flex-1 flex flex-col overflow-hidden min-h-0">
+      {/* Center: Tabs + editor. With a team the team's Home page reopens when
+          the last tab closes, so the tab strip is always present; without one
+          an empty Personal section shows a hint instead. */}
+      <div ref={tabContentAreaRef} className="relative flex-1 flex flex-col overflow-hidden min-h-0">
+        {hasTabs && <PagesSwipeNavigation targetRef={tabContentAreaRef} onStep={stepPagesHistory} />}
         {!hasTabs && !teamScope && (
           <div
             className="pages-mode-empty flex-1 flex items-center justify-center text-sm text-nim-faint"
@@ -849,13 +863,15 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
           </div>
         )}
         {hasTabs && (
+          <TrackerTabIssueKeyContext.Provider value={false}>
           <TabManager
             onTabClose={handleTabClose}
-            onNewTab={() => (teamScope ? openSharedHomeTab(true) : createPrimaryRef.current?.())}
+            onNewTab={() => (teamScope ? openSectionView('search', 'team') : createPrimaryRef.current?.())}
             isActive={isActive}
             onToggleAIChat={toggleChatCollapsed}
             isAIChatCollapsed={chatCollapsed}
             onTabDoubleClick={toggleEditorMaximized}
+            tabBarLeading={<PagesTabHistoryButtons onStep={stepPagesHistory} />}
           >
             <TabContent
               workspaceId={workspacePath}
@@ -867,11 +883,12 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
               trackerPageHeader
             />
           </TabManager>
+          </TrackerTabIssueKeyContext.Provider>
         )}
       </div>
 
       {/* Right: AI Chat sidebar (resizable via ChatSidebar built-in handle,
-          collapsible). Shown on every tab, including the Shared Docs Home. */}
+          collapsible). Shown on every tab, including Search and Types. */}
       {hasTabs && (
         <ChatSidebar
           ref={chatSidebarRef}

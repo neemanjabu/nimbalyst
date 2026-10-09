@@ -28,8 +28,8 @@ vi.mock('@nimbalyst/runtime/plugins/TrackerPlugin/models', () => ({
   globalRegistry: { get: () => ({ sharing: 'personal' }) },
 }));
 
-import { useTrackerItemBody } from '../useTrackerItemBody';
-import { applyPersonalPageAgentEdit } from '../../../services/personalAgentEdit';
+import { useTrackerItemBody, useTrackerTeam } from '../useTrackerItemBody';
+import { applyPersonalPageAgentEdit, restorePersonalTypedPageBody } from '../../../services/personalAgentEdit';
 
 const STORED = '# Idea\n\nTables: undecided.\n';
 
@@ -44,11 +44,16 @@ function markdownOf(editor: LexicalEditor): string {
 
 describe('agent edit to an open Personal typed page', () => {
   let saved: string[];
+  let snapshots: Array<[string, string, string]>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     saved = [];
+    snapshots = [];
     (window as any).electronAPI = {
+      invoke: vi.fn(async (channel: string, key: string, content: string, _type: string, description: string) => {
+        if (channel === 'history:create-snapshot') snapshots.push([key, content, description]);
+      }),
       documentService: {
         getTrackerItemContent: vi.fn(async () => ({ success: true, content: saved.at(-1) ?? STORED })),
         updateTrackerItemContent: vi.fn(async ({ content }: { content: string }) => {
@@ -64,7 +69,7 @@ describe('agent edit to an open Personal typed page', () => {
     delete (window as any).electronAPI;
   });
 
-  it('keeps the agent edit and the text typed before it', async () => {
+  it('keeps the agent edit and the text typed before it, and restores from history through the editor', async () => {
     const { result, unmount } = renderHook(() => useTrackerItemBody({
       itemId: item.id, item, workspacePath: '/ws', teamOrgId: null, forceFloatingToolbar: false,
     }));
@@ -104,8 +109,48 @@ describe('agent edit to an open Personal typed page', () => {
     const last = saved.at(-1) ?? '';
     expect(last).toContain('Tables: one shared DataTable.');
     expect(last).toContain('Typed just now.');
+    // The text the agent replaced, typing included, is in the page's history.
+    expect(result.current.historyKey).toBe('personal-doc://tracker-content/idea_1');
+    expect(snapshots).toEqual([['personal-doc://tracker-content/idea_1', expect.stringContaining('Typed just now.'), 'Before agent edit']]);
+    expect(snapshots[0]![1]).toContain('Tables: undecided.');
+
+    // Restoring that snapshot goes through the open editor and its autosave.
+    await restorePersonalTypedPageBody('idea_1', snapshots[0]![1]);
+    await act(async () => { await vi.runAllTimersAsync(); });
+    expect(markdownOf(editor)).toContain('Tables: undecided.');
+    expect(saved.at(-1)).toContain('Tables: undecided.');
 
     unregisterDiff();
     unmount();
+  });
+});
+
+// In the first seconds after launch main cannot read the team directory yet and
+// says so with `complete: false`. Reading its null team as "no team" opened a
+// team item's body in local mode.
+describe('useTrackerTeam while the team lookup is incomplete', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (window as any).electronAPI;
+  });
+
+  it('stays pending and re-asks until main can answer', async () => {
+    const answers = [
+      { success: true, team: null, complete: false },
+      { success: true, team: { orgId: 'org-1' }, complete: true },
+    ];
+    const invoke = vi.fn(async (channel: string) => (
+      channel === 'team:find-for-workspace' ? answers.shift() : { success: true, members: [] }
+    ));
+    (window as any).electronAPI = { invoke };
+
+    const { result } = renderHook(() => useTrackerTeam('/ws'));
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.teamOrgId).toBeUndefined();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(result.current.teamOrgId).toBe('org-1');
+    expect(invoke.mock.calls.filter((c) => c[0] === 'team:find-for-workspace')).toHaveLength(2);
   });
 });

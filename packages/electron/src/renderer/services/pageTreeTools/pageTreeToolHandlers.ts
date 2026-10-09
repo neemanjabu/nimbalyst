@@ -13,6 +13,8 @@ import {
   listPagesTool,
   movePageTreeNodeTool,
   renamePageTool,
+  searchPagesTool,
+  setPageFieldsTool,
   setPageTypeTool,
   type PageTreeToolEnv,
   type PageTreeToolResult,
@@ -40,12 +42,16 @@ function trackPageAction(channel: string, payload: ToolPayload): void {
 
 const TOOLS: Record<string, (env: PageTreeToolEnv, args: Record<string, unknown>) => Promise<PageTreeToolResult>> = {
   'mcp:listPages': listPagesTool,
+  'mcp:searchPages': searchPagesTool,
   'mcp:createSharedDoc': createPageTool,
   'mcp:createSharedFolder': createPageTool,
   'mcp:moveSharedItem': movePageTreeNodeTool,
   'mcp:renameSharedItem': renamePageTool,
   'mcp:deleteSharedItem': deletePageTool,
   'mcp:setPageType': setPageTypeTool,
+  'mcp:setPageFields': setPageFieldsTool,
+  // Loaded on first use: it brings in the share flow and its dialogs.
+  'mcp:importFileToPages': (env, args) => import('./importFileToPagesTool').then(({ importFileToPagesTool }) => importFileToPagesTool(env, args)),
 };
 
 /** Subscribe every page tree tool channel; returns the unsubscribers. */

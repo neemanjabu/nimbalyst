@@ -3,6 +3,7 @@ import { type ReadReceipt, type UnreadEntitySnapshot } from '../../../runtime/sr
 import { type CollabDocsCapability, type CollabHost, type CollabScope } from '../core/index';
 import { type ChangedSharedDoc } from './collabDiscovery';
 import type { CollabDocsDataSource } from './dataSource';
+import type { PageSearchRequest, PageSearchResponse } from '@nimbalyst/collab-protocol';
 import type { SharedDocument, SharedFolder, SharedItemPlacement, SharedParentKind, SharedTypePlacement } from './types';
 /** Where a page moves: its parent's kind and its order there (absent = no order). */
 export interface CollabPageMoveOptions {
@@ -20,6 +21,11 @@ export type CollabPlacementWriteResult = {
 } | {
     ok: false;
     error: string;
+};
+/** A restore from Trash: how many pages came back, and whether the page had to go to the section root. */
+export type CollabRestoreResult = CollabPlacementWriteResult & {
+    restored: number;
+    movedToRoot: boolean;
 };
 export type CollabDocsUIStatus = 'disconnected' | 'connecting' | 'syncing' | 'connected' | 'error';
 export interface CollabDiscoveryState {
@@ -47,7 +53,9 @@ export declare const allSharedDocumentsAtom: ListAtom<SharedDocument>;
 export declare const sharedDocumentsAtom: WritableAtom<SharedDocument[], [ListUpdate<SharedDocument>], void>;
 export declare const trashedSharedDocumentsAtom: Atom<SharedDocument[]>;
 /**
- * The readable documents of one scope, whether or not it is the active one.
+ * The readable documents a reference in one scope can name, whether or not it
+ * is the active scope: its own project's and, after them, the other projects'
+ * in the same org, since a link may point at another project's page.
  *
  * `sharedDocumentsAtom` answers for the scope the window is *browsing*, which
  * a window that never mounts a Shared Docs surface never sets -- the
@@ -60,6 +68,8 @@ export declare const trashedSharedDocumentsAtom: Atom<SharedDocument[]>;
  * a reference was rendered still reaches the reference.
  */
 export declare const sharedDocumentsForScopeAtom: import("jotai-family").AtomFamily<string, Atom<SharedDocument[]>>;
+/** `sharedDocumentsForScopeAtom` for the active scope: what a link can open and name. */
+export declare const linkableSharedDocumentsAtom: Atom<SharedDocument[]>;
 export declare const sharedFoldersAtom: ListAtom<SharedFolder>;
 /** Tracker types placed in the active scope's page tree, one per type. */
 export declare const sharedTypePlacementsAtom: ListAtom<SharedTypePlacement>;
@@ -129,6 +139,8 @@ export interface CollabDocsSessionAtoms {
     itemPlacements: ListAtom<SharedItemPlacement>;
     /** True when the tree is the one page tree (documents nest in documents). */
     pageTree: Atom<boolean>;
+    /** True when this section keeps a plain page's own fields (`pageFields.ts`). */
+    pageFields: Atom<boolean>;
     syncStatus: WritableAtom<CollabDocsUIStatus, [CollabDocsUIStatus], void>;
     hasTeam: WritableAtom<boolean, [boolean], void>;
     activeTeamUserId: Atom<string | null>;
@@ -189,6 +201,7 @@ export interface CollabDocsSession {
         };
     }): Promise<boolean>;
     updateDocumentTitle(documentId: string, title: string): Promise<CollabPlacementWriteResult>;
+    updateDocumentFields(documentId: string, patch: Record<string, unknown>): Promise<CollabPlacementWriteResult>;
     /**
      * Removes the index row. Only with `purge` (Trash's "Delete permanently" and
      * "Empty Trash") does a page already in Trash go for good; a server that
@@ -199,7 +212,12 @@ export interface CollabDocsSession {
     }): Promise<CollabPlacementWriteResult>;
     /** Recoverable: the page leaves the tree for Trash, keeping its body and place. */
     trashDocument(documentId: string): Promise<CollabPlacementWriteResult>;
-    restoreDocument(documentId: string): void;
+    /**
+     * Back from Trash with the pages that went with it, each in its place. A
+     * page whose parent is gone (deleted for good, or still in Trash) goes to
+     * the section root instead, and the result says so.
+     */
+    restoreDocument(documentId: string): Promise<CollabRestoreResult>;
     emptyTrash(): number;
     moveDocument(documentId: string, parentFolderId: string | null, options?: CollabPageMoveOptions): Promise<CollabPlacementWriteResult>;
     createFolder(name: string, parentFolderId: string | null): Promise<string>;
@@ -247,6 +265,12 @@ export interface CollabDocsSession {
     clearPendingFolder(): void;
     getDocuments(): SharedDocument[];
     getFolders(): SharedFolder[];
+    /**
+     * Pages whose body or title matches (`pageSearch.ts`). Typed-page hits have
+     * a null title for the caller to name from its tree (`nameTypedHits`). Null
+     * when the section cannot search now.
+     */
+    searchPages(request: PageSearchRequest): Promise<PageSearchResponse | null>;
 }
 export declare function createCollabDocsSession(scope: CollabScope, dataSource: CollabDocsDataSource, host: DocsHost): CollabDocsSession;
 export interface CollabDocsScopeLifecycleOptions {
@@ -262,6 +286,21 @@ export interface CollabDocsScopeLifecycle {
 export declare function createCollabDocsScopeLifecycle(host: DocsHost, options: CollabDocsScopeLifecycleOptions): CollabDocsScopeLifecycle;
 export declare function getCollabDocsSession(scopeKey: string): CollabDocsSession | null;
 export declare function getSharedDocumentsForScopeKey(scopeKey: string): SharedDocument[];
+/**
+ * The documents a link in this scope can open: the scope's own project's,
+ * then other projects' in the org. For opening and naming an existing link
+ * only; pickers and lists use `getSharedDocumentsForScopeKey`.
+ */
+export declare function getLinkableSharedDocumentsForScopeKey(scopeKey: string): SharedDocument[];
+/**
+ * Another project's page, when `documentId` names one and not one of this
+ * scope's own: the page and its project (a null project resolved to the
+ * primary). Writes to it are refused; reads go through that project.
+ */
+export declare function findOtherProjectDocument(scopeKey: string, documentId: string): {
+    document: SharedDocument;
+    projectId: string | null;
+} | null;
 export declare function getSharedFoldersForScopeKey(scopeKey: string): SharedFolder[];
 export declare function getFavoriteDocumentIdsForScopeKey(scopeKey: string): string[];
 export declare function setCollabScopeAvailability(scopeKey: string, available: boolean): void;

@@ -7,6 +7,11 @@
  */
 export { TrackerPageView, type TrackerPageViewProps } from './TrackerPageView';
 export { TrackerPageAddField, type TrackerPageAddFieldProps } from './TrackerPageAddField';
+export { PageHistoryButton } from './PageHistoryButton';
+export { PageHeaderBar, pageAncestorIcon, pageHeaderCrumbs, type PageHeaderBarProps, type PageHeaderMenuItem } from './PageHeaderBar';
+export { PlainPageHeader, type PlainPageHeaderProps } from './PlainPageHeader';
+export { PageFacts, pageTimeFacts, relativePageTime, type PageFact } from './PageFacts';
+export type { PageTreeAncestor } from '../embed/pageTreeAncestors';
 export { TypePageTable, typePageTypeIds, type TypePageTableProps } from './TypePageTable';
 export { TrackerLinksSection, type TrackerLinksSectionProps } from './TrackerLinksSection';
 export { fieldRelationLinks } from './fieldRelationLinks';
@@ -19,6 +24,7 @@ export {
   sameTrackerPageCrumb,
   trackerPageCrumb,
   trackerPageCrumbFolders,
+  trackerPageCrumbFolderRefs,
   type CrumbDocument,
   type CrumbFolder,
   type CrumbItemLookup,
@@ -26,4 +32,10 @@ export {
   type CrumbPlacement,
   type TrackerPageCrumb,
 } from './trackerPageCrumb';
+// A Pages section's Search table and Types map.
+export { PagesSearchView, type PagesOpenOptions, type PagesSearchViewProps, type PagesSearchLane } from './PagesSearchView';
+export { PagesTypesView, type PagesTypesViewMode, type PagesTypesViewProps } from './PagesTypesView';
+export { EMPTY_PAGES_SEARCH, pagesSearchQuery, parsePagesSearch, type PagesSearchPageInput, type PagesSearchState } from './pagesSearch';
 export { TITLE_MAX_HEIGHT_PX, resizeTitleField, sanitizeTitleInput, useAutoSizedTitle } from './trackerTitleAutoSize';
+
+export { parsePlacedViewHandoff, type PlacedViewHandoff } from './placedViewHandoff';

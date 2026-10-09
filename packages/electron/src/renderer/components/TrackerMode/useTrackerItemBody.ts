@@ -25,6 +25,8 @@ import { useTrackerContentCollab } from '../../hooks/useTrackerContentCollab';
 import { useColdPaintFallback } from '../../hooks/useColdPaintFallback';
 import { useCollabSyncCurtain } from '../../hooks/useCollabSyncCurtain';
 import { registerLiveTypedPageEditor } from '../../services/personalAgentEdit';
+import { useCollabBodyHistory } from '../HistoryDialog/useCollabBodyHistory';
+import { personalTypedPageHistoryKey } from '../../../shared/personalPageUri';
 
 /** How this item's body is edited -- see `resolveTrackerContentMode`. */
 export type TrackerContentMode = 'file-backed' | 'local-pglite' | 'collaborative';
@@ -39,6 +41,9 @@ export interface TrackerTeam {
   teamOrgId: string | null | undefined;
   teamMembers: TeamMemberOption[];
 }
+
+/** Back-off between re-asks while main reports the team lookup as incomplete. */
+const INCOMPLETE_TEAM_LOOKUP_RETRY_MS = [500, 1000, 2000, 4000, 8000] as const;
 
 /**
  * Detect whether this workspace has a team. The team check feeds the content
@@ -69,12 +74,24 @@ export function useTrackerTeam(workspacePath: string | undefined): TrackerTeam {
         // On timeout, degrade to local mode (null) -- the body still paints from
         // the cold cache instead of spinning indefinitely.
         const TEAM_LOOKUP_TIMEOUT_MS = 12_000;
-        const teamResult = await Promise.race([
+        const lookup = () => Promise.race([
           window.electronAPI.invoke('team:find-for-workspace', workspacePath),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('team:find-for-workspace timed out')), TEAM_LOOKUP_TIMEOUT_MS),
           ),
         ]);
+        let teamResult = await lookup();
+        // `complete: false` means main could not read the team directory yet
+        // (typically the first seconds after launch), so its null team is not
+        // "this workspace has no team". Answering null here opened a team item's
+        // body in local mode. Stay pending and ask again; give up to local mode
+        // only once the schedule runs out.
+        for (const delayMs of INCOMPLETE_TEAM_LOOKUP_RETRY_MS) {
+          if (cancelled || teamResult?.complete !== false) break;
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          if (cancelled) return;
+          teamResult = await lookup();
+        }
         if (cancelled) return;
         const orgId: string | null = teamResult?.success && teamResult.team?.orgId
           ? teamResult.team.orgId
@@ -151,6 +168,12 @@ export interface TrackerItemBody {
   recoveryEditor: LexicalEditor | null;
   localEditorConfig: EditorConfig | null;
   collabEditorConfig: EditorConfig | null;
+  /**
+   * What the history dialog opens for this body: the room's `collab://` URI
+   * for a collaborative body, the local-history key for a Personal one. Null
+   * while neither applies (file-backed, or still connecting).
+   */
+  historyKey: string | null;
 }
 
 export function useTrackerItemBody({
@@ -297,6 +320,7 @@ export function useTrackerItemBody({
     commentsConfig,
     providerEpoch,
     bodyCacheMarkdown,
+    history: collabHistory,
   } = useTrackerContentCollab({
     itemId,
     title: item?.issueKey || (item ? getRecordTitle(item) : itemId),
@@ -511,6 +535,15 @@ export function useTrackerItemBody({
         unregisterLiveEditorRef.current = registerLiveTypedPageEditor(itemId, {
           editor,
           getContent: () => getContentFnRef.current?.() ?? contentMarkdown ?? '',
+          replaceContent: (markdown: string) => {
+            editor.update(() => {
+              // Clearing a selected node without moving selection first makes
+              // Lexical throw "selection has been lost ..." (NIM-2005).
+              $setSelection(null);
+              $getRoot().clear();
+              $convertFromEnhancedMarkdownString(markdown, getEditorTransformers());
+            });
+          },
         });
       },
     };
@@ -571,6 +604,18 @@ export function useTrackerItemBody({
     };
   }, [contentMode, collabConfig, collabLoading, commentsConfig, contentLoaded, contentMarkdown, forceFloatingToolbar, saveContent]);
 
+  // A collaborative body's page history: revisions in its room, restored
+  // through this editor.
+  useCollabBodyHistory({
+    uri: contentMode === 'collaborative' ? collabHistory?.uri ?? null : null,
+    client: collabHistory?.client ?? null,
+    syncProvider,
+    editor: contentMode === 'collaborative' ? recoveryEditor : null,
+  });
+  const historyKey = contentMode === 'collaborative'
+    ? collabHistory?.uri ?? null
+    : contentMode === 'local-pglite' && sharing === 'personal' ? personalTypedPageHistoryKey(itemId) : null;
+
   return {
     sharing,
     isItemPublished,
@@ -586,5 +631,6 @@ export function useTrackerItemBody({
     recoveryEditor,
     localEditorConfig,
     collabEditorConfig,
+    historyKey,
   };
 }

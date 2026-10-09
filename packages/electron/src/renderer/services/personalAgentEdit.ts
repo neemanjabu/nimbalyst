@@ -3,7 +3,9 @@
  * an agent edit lands as final text with no review step; the page's local
  * history is how a person reverts it.
  *
- *   personal://<documentId>              Personal page body (`personal-pages:*` IPC)
+ *   personal://<documentId>              Local page body: the page's markdown file in the
+ *                                        wiki folder (`local-wiki:*` IPC), or a database
+ *                                        Personal page not exported yet (`personal-pages:*`)
  *   personal://tracker-content/<itemId>  Personal typed-page body (the tracker item's content)
  *
  * A page open in a tab is edited through its mounted editor, which saves
@@ -11,8 +13,8 @@
  * showing old text, and a typed page's pending autosave would write that old
  * text straight back over the agent's edit. Otherwise the stored body is
  * edited directly: read with its version, apply the replacements, write back
- * only if the version still matches (one retry on a race). A plain page keeps
- * its pre-edit text in history first.
+ * only if the version still matches (one retry on a race). Either kind keeps
+ * its pre-edit text in local history first.
  */
 import type { LexicalEditor } from 'lexical';
 import type { TextReplacement } from '@nimbalyst/runtime';
@@ -23,22 +25,30 @@ import {
   type ApplyMarkdownReplaceResult,
 } from '@nimbalyst/runtime/editor/plugins/DiffPlugin/DiffCommands';
 import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
-import { parsePersonalPageUri } from '../../shared/personalPageUri';
+import { parsePersonalPageUri, personalTypedPageHistoryKey } from '../../shared/personalPageUri';
 
 const PERSONAL_DOC_EDITOR_PREFIX = 'personal-doc://';
 
 type BodyWrite = { version: number } | { conflict: true; version: number; content: string };
+/** A Local wiki page: its body (frontmatter excluded), body version and markdown file. */
+type WikiPageBody = { content: string; version: string; filePath: string };
 type TypedPageBodyWrite = { written: true } | { conflict: true; version: number };
 
 /** A typed page's body editor while it is mounted. */
 export interface LiveTypedPageEditor {
   editor: LexicalEditor;
   getContent(): string;
+  /** Replace the whole body (a history restore); the editor's autosave stores it. */
+  replaceContent(markdown: string): void;
 }
 
 export interface PersonalPageIo {
   getBody(workspacePath: string, documentId: string): Promise<{ content: string; version: number } | null>;
   updateBody(workspacePath: string, documentId: string, content: string, expectedVersion?: number): Promise<BodyWrite>;
+  /** The page in the Local wiki folder; null when it is not there (a database page, or unknown). */
+  getWikiPage?(workspacePath: string, documentId: string): Promise<WikiPageBody | null>;
+  /** Writes a Local wiki page's body if it is still at `expectedVersion`. */
+  writeWikiPage?(workspacePath: string, documentId: string, content: string, expectedVersion: string): Promise<{ ok: boolean }>;
   /** Keep text in a page's local history under its history key. */
   keepInHistory(historyKey: string, content: string, description: string): Promise<void>;
   /** The body with its `body_version`; version null when it cannot be read together with the text. */
@@ -90,6 +100,14 @@ const rendererIo: PersonalPageIo = {
     window.electronAPI.invoke('personal-pages:get-body', workspacePath, documentId),
   updateBody: (workspacePath, documentId, content, expectedVersion) =>
     window.electronAPI.invoke('personal-pages:update-body', workspacePath, documentId, content, expectedVersion),
+  getWikiPage: async (workspacePath, documentId) => {
+    const filePath = await window.electronAPI.invoke('local-wiki:page-path', workspacePath, documentId) as string | null;
+    if (!filePath) return null;
+    const body = await window.electronAPI.invoke('local-wiki:read-body', workspacePath, documentId) as { markdown: string; version: string };
+    return { content: body.markdown, version: body.version, filePath };
+  },
+  writeWikiPage: (workspacePath, documentId, content, expectedVersion) =>
+    window.electronAPI.invoke('local-wiki:write-body', workspacePath, documentId, content, expectedVersion),
   keepInHistory: async (historyKey, content, description) => {
     await window.electronAPI.invoke('history:create-snapshot', historyKey, content, 'pre-apply', description);
   },
@@ -153,12 +171,32 @@ export async function readPersonalPageForAgent(
     if (live) return live.getContent();
     return markdownOf((await io.getTypedPageBody(target.itemId)).content, `The typed page ${target.itemId}`);
   }
+  const wikiPage = workspacePath && io.getWikiPage ? await io.getWikiPage(workspacePath, target.documentId) : null;
+  if (wikiPage) {
+    // An open file tab may hold edits not saved yet; its editor has the text the person sees.
+    return io.mountedEditor.has(wikiPage.filePath) ? io.mountedEditor.getContent(wikiPage.filePath) : wikiPage.content;
+  }
   const editorPath = personalDocEditorPath(target.documentId);
   if (io.mountedEditor.has(editorPath)) return io.mountedEditor.getContent(editorPath);
   if (!workspacePath) throw new Error(`No workspace is open to read ${uri}.`);
   const body = await io.getBody(workspacePath, target.documentId);
   if (!body) throw new Error(`Unknown Personal page '${target.documentId}'.`);
   return body.content;
+}
+
+/**
+ * A Local page's stored body: the wiki file's body, or a database page's body
+ * with its version. Mounted editors are not consulted.
+ */
+export async function readLocalPageBody(
+  workspacePath: string,
+  documentId: string,
+  io: PersonalPageIo = rendererIo,
+): Promise<{ markdown: string; version?: number }> {
+  const wikiPage = io.getWikiPage ? await io.getWikiPage(workspacePath, documentId) : null;
+  if (wikiPage) return { markdown: wikiPage.content };
+  const body = await io.getBody(workspacePath, documentId);
+  return { markdown: body?.content ?? '', ...(body ? { version: body.version } : {}) };
 }
 
 /** The edit lands as final text in the mounted editor; its autosave stores it. */
@@ -183,11 +221,30 @@ async function editStoredTypedPage(itemId: string, replacements: TextReplacement
     const current = markdownOf(body.content, `The typed page ${itemId}`);
     const next = applyTextReplacementsToString(current, replacements);
     if (next === current) return;
+    if (attempt === 0) await io.keepInHistory(personalTypedPageHistoryKey(itemId), current, 'Before agent edit');
     const written = await io.setTypedPageBody(itemId, next, version);
     if (!('conflict' in written)) return;
     knownVersion = written.version;
   }
   throw new Error(`The typed page '${itemId}' kept changing while the edit was applied. Read it again and retry.`);
+}
+
+async function editStoredWikiPage(
+  workspacePath: string,
+  documentId: string,
+  first: WikiPageBody,
+  replacements: TextReplacement[],
+  io: PersonalPageIo,
+): Promise<void> {
+  let body: WikiPageBody | null = first;
+  for (let attempt = 0; attempt < 2 && body; attempt++) {
+    const next = applyTextReplacementsToString(body.content, replacements);
+    if (next === body.content) return;
+    if (attempt === 0) await io.keepInHistory(body.filePath, body.content, 'Before agent edit');
+    if ((await io.writeWikiPage!(workspacePath, documentId, next, body.version)).ok) return;
+    body = await io.getWikiPage!(workspacePath, documentId);
+  }
+  throw new Error(`The Local page '${documentId}' kept changing while the edit was applied. Read it again and retry.`);
 }
 
 async function editStoredPersonalPage(
@@ -224,11 +281,23 @@ export async function applyPersonalPageAgentEdit(
   try {
     if (target.kind === 'typed-page') {
       const live = io.liveTypedPage(target.itemId);
-      if (live) return editLiveTypedPage(live, replacements);
+      if (live) {
+        await io.keepInHistory(personalTypedPageHistoryKey(target.itemId), live.getContent(), 'Before agent edit');
+        return editLiveTypedPage(live, replacements);
+      }
       await editStoredTypedPage(target.itemId, replacements, io);
       return { success: true };
     }
 
+    const wikiPage = options.workspacePath && io.getWikiPage ? await io.getWikiPage(options.workspacePath, target.documentId) : null;
+    if (wikiPage) {
+      if (io.mountedEditor.has(wikiPage.filePath)) {
+        const result = await io.mountedEditor.applyReplacements(wikiPage.filePath, replacements, options.requestId);
+        return result ?? { success: false, error: 'No result returned from the open Local page.' };
+      }
+      await editStoredWikiPage(options.workspacePath!, target.documentId, wikiPage, replacements, io);
+      return { success: true };
+    }
     const editorPath = personalDocEditorPath(target.documentId);
     if (io.mountedEditor.has(editorPath)) {
       const result = await io.mountedEditor.applyReplacements(editorPath, replacements, options.requestId);
@@ -242,4 +311,39 @@ export async function applyPersonalPageAgentEdit(
   } catch (error) {
     return failure(error);
   }
+}
+
+const RESTORE_CONFLICT = 'This page changed while restoring. Its current text was kept; try again.';
+
+/**
+ * Restore a Personal typed page's body from its local history. An open body
+ * editor takes the restored text itself, so its pending autosave cannot write
+ * the replaced text back over it; otherwise the stored body is written at the
+ * version it was read at.
+ *
+ * A restore replaces the whole body, so a refused write means someone saved
+ * after the read, and it rejects rather than overwrite that save. A body read
+ * without its version is written at the version a refused write reports, and
+ * only while the text is still what was read.
+ */
+export async function restorePersonalTypedPageBody(
+  itemId: string,
+  markdown: string,
+  io: PersonalPageIo = rendererIo,
+): Promise<void> {
+  const live = io.liveTypedPage(itemId);
+  if (live) {
+    live.replaceContent(markdown);
+    return;
+  }
+  const read = await io.getTypedPageBody(itemId);
+  const written = await io.setTypedPageBody(itemId, markdown, read.version ?? 0);
+  if (!('conflict' in written)) return;
+  if (read.version !== null) throw new Error(RESTORE_CONFLICT);
+  const reread = await io.getTypedPageBody(itemId);
+  const moved = JSON.stringify(reread.content) !== JSON.stringify(read.content)
+    || (reread.version !== null && reread.version !== written.version);
+  if (moved) throw new Error(RESTORE_CONFLICT);
+  const retried = await io.setTypedPageBody(itemId, markdown, written.version);
+  if ('conflict' in retried) throw new Error(RESTORE_CONFLICT);
 }

@@ -6,6 +6,7 @@ import type {
   CollabDataSource,
   Unsubscribe,
 } from '@nimbalyst/collab-client/core';
+import type { PageSearchRequest, PageSearchResponse } from '@nimbalyst/collab-protocol';
 import type { SharedDocument, SharedFolder, SharedItemPlacement, SharedParentKind, SharedTypePlacement } from './types';
 
 // Re-exported here because the docs barrel only re-exports document and folder.
@@ -25,6 +26,11 @@ export type CollabDocsCommand =
       metadata?: { metadataVersion: 2; fileExtension: string; editorId: string };
     }
   | { type: 'update-document-title'; documentId: string; title: string }
+  /**
+   * A plain page's own fields (`pageFields.ts`), as a patch: a key set to null
+   * clears that field, an absent key keeps it. The store validates the result.
+   */
+  | { type: 'set-document-fields'; documentId: string; fields: Record<string, unknown> }
   /** `purge` permanently deletes a page in Trash; only Trash's permanent delete sets it. */
   | { type: 'remove-document'; documentId: string; purge?: true }
   | { type: 'trash-document'; documentId: string; trashedAt: number }
@@ -48,7 +54,8 @@ export type CollabDocsCommand =
     }
   | { type: 'rename-folder'; folderId: string; name: string }
   | { type: 'move-folder'; folderId: string; parentFolderId: string | null }
-  | { type: 'remove-folder'; folderId: string }
+  /** `purge` permanently deletes a page in Trash and the pages in Trash below it (Personal pages). */
+  | { type: 'remove-folder'; folderId: string; purge?: true }
   | { type: 'refresh-folders' }
   | {
       type: 'set-type-placement';
@@ -79,6 +86,12 @@ export interface CollabDocsCommandResult extends CollabCommandResult {
    * to decide whether the room is known-reachable yet (NIM-2472).
    */
   registrationAcked?: boolean;
+  /**
+   * Personal pages, `remove-document` / `remove-folder` with `purge`: how many
+   * pages were deleted for good. 0 when none was still in Trash as read, for
+   * example because another window restored it first.
+   */
+  purged?: number;
 }
 
 /**
@@ -100,6 +113,15 @@ export interface CollabDocsSnapshot extends CollabDataSnapshot<SharedDocument, S
    * is ignored. Absent from an older server, which keeps the folder tree.
    */
   pageTree?: boolean;
+  /**
+   * The team's primary project (the team snapshot's `metadata.teamProjectId`).
+   * The session shows one project: a document with no project (an older
+   * server) belongs to the primary, and so does a scope with no project id.
+   * Absent while unknown; then nothing is split off.
+   */
+  primaryProjectId?: string | null;
+  /** True when this store keeps a plain page's own fields; absent hides them. */
+  pageFields?: boolean;
 }
 
 export type CollabDocsDataChange =
@@ -112,6 +134,12 @@ export interface CollabDocsDataSource extends Omit<
 > {
   snapshot(): Promise<CollabDocsSnapshot>;
   subscribe(cb: (change: CollabDocsDataChange) => void): Unsubscribe;
+  /**
+   * Pages whose bodies match `request` (see `@nimbalyst/collab-protocol`
+   * `pageSearch.ts`). Null when this section cannot answer now (offline, not
+   * connected yet). Absent on a source with no body search.
+   */
+  searchPages?(request: PageSearchRequest): Promise<PageSearchResponse | null>;
 }
 
 // Compile-time assertion that the document command union stays compatible

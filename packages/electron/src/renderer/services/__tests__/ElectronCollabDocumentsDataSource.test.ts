@@ -17,6 +17,95 @@ const scope: CollabScope = {
 };
 
 describe('ElectronCollabDocumentsDataSource', () => {
+  it('confirms a rename only from the stored title, and exposes refusal, lost acknowledgement and old servers', async () => {
+    vi.useFakeTimers();
+    let config!: TeamSyncConfig;
+    const provider = {
+      connect: vi.fn(async () => undefined), getStatus: () => 'connected',
+      echoesTitleWrites: vi.fn(() => true), updateDocumentTitle: vi.fn(async (_id: string, _title: string, _options: { requestId: string }) => undefined), destroy: vi.fn(),
+    };
+    const source = new ElectronCollabDocumentsDataSource({
+      scope, getJwt: async () => asTeamJwt('team-jwt'), placementConfirmTimeoutMs: 100,
+      createProvider: (next) => { config = next; return provider as any; },
+    });
+    const rename = () => source.command({ type: 'update-document-title', documentId: 'page-1', title: 'Design' });
+    const row = { documentId: 'page-1', title: 'design', documentType: 'markdown', createdBy: 'member', createdAt: 1, updatedAt: 2 };
+    try {
+      let done = false;
+      const pending = rename().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(false);
+      config.onDocumentChanged?.(row);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(false);
+      config.onDocumentChanged?.({ ...row, title: 'Design' });
+      await pending;
+      expect(done).toBe(true);
+
+      const refused = rename().catch((error: Error) => error.message);
+      await vi.advanceTimersByTimeAsync(0);
+      const requestId = provider.updateDocumentTitle.mock.calls.at(-1)![2].requestId;
+      config.onWriteRefused?.(requestId, { code: 'forbidden', message: 'Access removed' });
+      expect(await refused).toMatch(/Access removed/);
+
+      const lost = rename().catch((error: Error) => error.message);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await lost).toMatch(/did not confirm the rename/);
+      provider.echoesTitleWrites.mockReturnValue(false);
+      const sent = provider.updateDocumentTitle.mock.calls.length;
+      await expect(rename()).rejects.toThrow(/server.*rename/i);
+      expect(provider.updateDocumentTitle).toHaveBeenCalledTimes(sent);
+    } finally {
+      source.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('stores page fields only on a server that says so, confirmed by the echo that holds the patch', async () => {
+    vi.useFakeTimers();
+    let config!: TeamSyncConfig;
+    const provider = {
+      connect: vi.fn(async () => undefined), getStatus: () => 'connected', storesPageFields: vi.fn(() => true),
+      setDocumentFields: vi.fn((_id: string, _fields: Record<string, unknown>, _options: { requestId: string }) => undefined),
+      getDocuments: () => [], getFolders: () => [], getTypePlacements: () => null, getItemPlacements: () => null,
+      getTeamState: () => null, isPageTree: () => true, destroy: vi.fn(),
+    };
+    const source = new ElectronCollabDocumentsDataSource({
+      scope, getJwt: async () => asTeamJwt('team-jwt'), placementConfirmTimeoutMs: 100,
+      createProvider: (next) => { config = next; return provider as any; },
+    });
+    const setFields = () => source.command({ type: 'set-document-fields', documentId: 'page-1', fields: { status: 'current', owner: null } });
+    const row = { documentId: 'page-1', title: 'Design', documentType: 'markdown', createdBy: 'member', createdAt: 1, updatedAt: 2 };
+    try {
+      expect((await source.snapshot()).pageFields).toBe(true);
+      let done = false;
+      const pending = setFields().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.setDocumentFields).toHaveBeenCalledWith('page-1', { status: 'current', owner: null }, { requestId: expect.any(String) });
+      // A teammate's echo that does not hold the patch yet is not the confirmation.
+      config.onDocumentChanged?.({ ...row, fields: { status: 'draft', owner: 'ana@example.com' } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(done).toBe(false);
+      // Another key set meanwhile does not stop the patch from being recognized.
+      config.onDocumentChanged?.({ ...row, fields: { status: 'current', tags: ['sync'] } });
+      await pending;
+
+      const refused = setFields().catch((error: Error) => error.message);
+      await vi.advanceTimersByTimeAsync(0);
+      config.onWriteRefused?.(provider.setDocumentFields.mock.calls.at(-1)![2].requestId, { code: 'forbidden', message: 'Read only' });
+      expect(await refused).toMatch(/Read only/);
+
+      provider.storesPageFields.mockReturnValue(false);
+      expect((await source.snapshot()).pageFields).toBeUndefined();
+      const sent = provider.setDocumentFields.mock.calls.length;
+      await expect(setFields()).rejects.toThrow(/page fields/);
+      expect(provider.setDocumentFields).toHaveBeenCalledTimes(sent);
+    } finally {
+      source.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('projects provider snapshots/events and routes commands through the provider', async () => {
     let config!: TeamSyncConfig;
     const observeStatus = vi.fn();
@@ -71,8 +160,11 @@ describe('ElectronCollabDocumentsDataSource', () => {
       refreshItemPlacements: vi.fn(async () => null),
       registerDocument: vi.fn(async () => true),
       moveDocument: vi.fn(),
-      getTeamState: vi.fn(() => ({ members: [] })),
-      updateDocumentTitle: vi.fn(async () => undefined),
+      getTeamState: vi.fn(() => ({ members: [], metadata: { teamProjectId: 'project-primary' } })),
+      echoesTitleWrites: vi.fn(() => true),
+      updateDocumentTitle: vi.fn(async (documentId: string, title: string) => {
+        config.onDocumentChanged?.({ documentId, title, documentType: 'markdown', createdBy: 'member-one', createdAt: 1, updatedAt: 5 });
+      }),
       refreshFolders: vi.fn(async () => []),
       setTypePlacement: vi.fn(),
       removeTypePlacement: vi.fn(),
@@ -106,6 +198,8 @@ describe('ElectronCollabDocumentsDataSource', () => {
       typePlacements: [expect.objectContaining({ typeId: 'module', parentFolderId: 'folder-1', parentKind: 'page' })],
       itemPlacements: [expect.objectContaining({ itemId: 'item-1', parentId: 'doc-1', parentKind: 'page', sortOrder: 2 })],
       pageTree: true,
+      // The session splits other projects off; a null-project row is the primary's.
+      primaryProjectId: 'project-primary',
     });
     config.onDocumentChanged?.({
       documentId: 'doc-2',
@@ -140,7 +234,7 @@ describe('ElectronCollabDocumentsDataSource', () => {
     await expect(source.command({ type: 'refresh-item-placements' }))
       .resolves.toEqual({ ok: true, itemPlacements: null });
 
-    expect(changes).toEqual(['items-upserted', 'containers-removed', 'snapshot', 'status']);
+    expect(changes).toEqual(['items-upserted', 'containers-removed', 'snapshot', 'status', 'items-upserted']);
     expect(provider.setTypePlacement).toHaveBeenCalledWith('module', 'item-9', 4, 'item');
     expect(provider.removeTypePlacement).toHaveBeenCalledWith('module');
     // No server list yet (older server): the snapshot must not claim an empty one.
@@ -152,7 +246,7 @@ describe('ElectronCollabDocumentsDataSource', () => {
     expect(olderServer).not.toHaveProperty('itemPlacements');
     expect(olderServer).not.toHaveProperty('pageTree');
     expect(observeStatus).toHaveBeenCalledWith('connected');
-    expect(provider.updateDocumentTitle).toHaveBeenCalledWith('doc-1', 'Renamed');
+    expect(provider.updateDocumentTitle).toHaveBeenCalledWith('doc-1', 'Renamed', { requestId: expect.any(String) });
     expect(provider.connect).toHaveBeenCalledTimes(1);
     source.dispose();
     expect(provider.destroy).toHaveBeenCalledTimes(1);
@@ -173,6 +267,7 @@ describe('ElectronCollabDocumentsDataSource', () => {
         getTypePlacements: vi.fn(() => null),
         getItemPlacements: vi.fn(() => null),
         isPageTree: vi.fn(() => true),
+        getTeamState: vi.fn(() => null),
         setItemPlacement: vi.fn(),
         removeItemPlacement: vi.fn(),
         destroy: vi.fn(),
@@ -229,6 +324,7 @@ describe('ElectronCollabDocumentsDataSource', () => {
         getTypePlacements: vi.fn(() => null),
         getItemPlacements: vi.fn(() => null),
         isPageTree: vi.fn(() => true),
+        getTeamState: vi.fn(() => null),
         // A server that sends the author its own page writes says so.
         echoesAuthorWrites: vi.fn(() => true),
         moveDocument: vi.fn(),
@@ -328,6 +424,7 @@ describe('ElectronCollabDocumentsDataSource', () => {
         getTypePlacements: vi.fn(() => null),
         getItemPlacements: vi.fn(() => null),
         isPageTree: vi.fn(() => true),
+        getTeamState: vi.fn(() => null),
         moveDocument: vi.fn(),
         removeDocument: vi.fn(),
         removeFolder: vi.fn(),

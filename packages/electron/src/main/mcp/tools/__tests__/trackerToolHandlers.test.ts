@@ -193,6 +193,13 @@ vi.mock('../../../services/MainBodyDocService', () => ({
   initializeHeadlessBodyMarkdown: mockInitializeHeadlessBodyMarkdown,
 }));
 
+// What the recorder keeps is covered in typedPageBodyHistory.test.ts; here we
+// only care that every MCP body write reaches it.
+const mockRecordTypedPageBodySnapshot = vi.hoisted(() => vi.fn(async (..._args: any[]) => true));
+vi.mock('../../../services/tracker/typedPageBodyHistory', () => ({
+  recordTypedPageBodySnapshot: mockRecordTypedPageBodySnapshot,
+}));
+
 // Counter behaviour lives in tracker/__tests__/localKeyAllocator.test.ts; the
 // create path only has to sweep itself.
 vi.mock('../../../services/tracker/localKeyAllocator', () => ({
@@ -1031,6 +1038,7 @@ describe('handleTrackerCreate issue-key timing', () => {
   // unpublished item reports its uuid to the agent: it has no team key, and
   // its number was only minted by a later list (NIM.2842).
   it('reports the local number as the ref for an unpublished item', async () => {
+    mockGlobalRegistry.get.mockImplementation((type?: string) => type === 'bug' ? { localNumbers: true } : undefined);
     vi.mocked(isTrackerSyncActive).mockReturnValue(false);
     vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
     const numbered = makeRow({
@@ -1066,6 +1074,22 @@ describe('handleTrackerCreate issue-key timing', () => {
     // Sync is inactive here, so "publish it" is not advice this workspace can
     // act on and must not appear.
     expect(summary).not.toContain('until it is published');
+  });
+
+  // Local numbers are opt-in per type; a type that says nothing gets none.
+  it('does not number an item whose type has not opted in to local numbers', async () => {
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    vi.mocked(shouldSyncTrackerItem).mockReturnValue(false);
+    const plain = makeRow({ id: 'bug_test', workspace: '/tmp/ws', issue_key: null, issue_number: null, local_key: null });
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })       // INSERT
+      .mockResolvedValueOnce({ rows: [plain] })  // resolve created
+      .mockResolvedValueOnce({ rows: [plain] }); // notifyTrackerItemAdded
+
+    const { structured } = parseResult(await handleTrackerCreate({ type: 'bug', title: 'Plain bug' }, '/tmp/ws'));
+
+    expect(assignLocalKeysToRows).not.toHaveBeenCalled();
+    expect(structured.item.localKey).toBeUndefined();
   });
 
   it('leaves a team draft without any key', async () => {
@@ -2104,6 +2128,8 @@ describe('handleTrackerCreate session linking', () => {
 
     expect(mockApplyHeadlessBodyMarkdown).not.toHaveBeenCalled();
     expect(mockInitializeHeadlessBodyMarkdown).not.toHaveBeenCalled();
+    // A Personal typed page created by an agent has history from its first body.
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledWith('bug_test', 'bug', 'Created body text');
   });
 
   it('persists an explicitly empty create body instead of treating it as omitted', async () => {
@@ -2480,6 +2506,21 @@ describe('handleTrackerUpdate description / collab body', () => {
     expect(payload.structured.tool).toBe('tracker_update');
   });
 
+  it('archives an item that predates a required field, and still refuses a write that clears it', async () => {
+    const decision = makeRow({ id: 'dec_old', type: 'decision', workspace: '/tmp/ws', source: 'native', document_path: '' });
+    mockQuery.mockResolvedValue({ rows: [decision] });
+    mockGlobalRegistry.validate.mockReturnValue({
+      valid: false,
+      errors: [{ field: 'decisionId', message: "Field 'decisionId' is required" }],
+    });
+
+    const archived = await handleTrackerUpdate({ id: 'dec_old', archived: true }, '/tmp/ws');
+    expect(JSON.parse(archived.content[0].text!).structured.action).not.toBe('validationFailed');
+
+    const cleared = await handleTrackerUpdate({ id: 'dec_old', fields: { decisionId: '' } }, '/tmp/ws');
+    expect(JSON.parse(cleared.content[0].text!).structured).toMatchObject({ action: 'validationFailed', errors: [{ field: 'decisionId' }] });
+  });
+
   it('clears nested relationship fields with unsetFields and propagates inverse removals (NIM-1305)', async () => {
     mockDocumentServices.set('/tmp/ws', mockDocService);
     (mockGlobalRegistry.get as any).mockReturnValue({
@@ -2709,6 +2750,18 @@ describe('handleTrackerUpdate description / collab body', () => {
       1,
       JSON.stringify('phase 5 body bump'),
     ]);
+  });
+
+  it('keeps the replaced body and the new one in local history', async () => {
+    setupUpdateQueueWithDescription({ content: JSON.stringify('# Hand-written body') });
+
+    const result = await handleTrackerUpdate({ id: 'NIM-1', description: '# Agent body' }, '/tmp/ws');
+
+    expect(result.isError).toBe(false);
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledTimes(1);
+    expect(mockRecordTypedPageBodySnapshot).toHaveBeenCalledWith('bug_target', 'bug', '# Agent body', {
+      replaced: JSON.stringify('# Hand-written body'),
+    });
   });
 
   it('seeds the body when description arrives via the fields bag (NIM-438)', async () => {

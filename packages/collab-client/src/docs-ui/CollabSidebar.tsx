@@ -1,6 +1,6 @@
 import { SharedDocumentLink } from './SharedDocumentLink';
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { isPersonalCollabScope, type CollabDocumentTypeDescriptor } from '@nimbalyst/collab-client/core';
+import { collabOpenOptions, isPersonalCollabScope, type CollabDocumentTypeDescriptor } from '@nimbalyst/collab-client/core';
 import { atom, useAtomValue } from 'jotai';
 import { store } from '@nimbalyst/runtime/store';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
@@ -16,12 +16,12 @@ import {
 import {
   type SharedDocument,
   type SharedFolder,
+  type SharedParentKind,
   buildCollabTreeAdaptive,
   collectFolderSubtree,
   collectPageSubtree,
   planPageRemoval,
   getSharedDocumentDisplayPath,
-  filterCollabTree,
   pruneEmptyFolders,
   getCollabDocumentPath,
   getCollabNodeName,
@@ -47,9 +47,11 @@ import {
   type CollabPageMoveTarget,
   type CollabRowDrop,
 } from './CollabTypeTreeRows';
-import { useFloatingMenu, FloatingPortal, virtualElement } from './primitives/useFloatingMenu';
-import { CollabSectionMenu, CollabTreeEmptyState } from './CollabSectionRoot';
+import { useFloatingMenu, FloatingPortal, virtualElement } from '../ui-primitives/useFloatingMenu';
+import { CollabSectionMenu, CollabTreeEmptyState, type CollabSectionMenuItem } from './CollabSectionRoot';
+import { CollabSidebarTrashEntry } from './CollabTrash';
 import { revealKeysFor } from './collabTreeReveal';
+import { usePageActionRequest, type CollabPageActionRequest } from './usePageActionRequest';
 
 const CYCLE_WARNING = 'A page cannot move inside one of its own child pages.';
 
@@ -68,9 +70,9 @@ type PageTreeBuilder = Awaited<ReturnType<typeof loadPageTreeBuilder>>;
 const CollabPageMenuHead = React.lazy(() => loadPageMenu().then((m) => ({ default: m.CollabPageMenuHead })));
 const CollabPageDeleteEntry = React.lazy(() => loadPageMenu().then((m) => ({ default: m.CollabPageDeleteEntry })));
 const CollabItemMenu = React.lazy(() => loadPageMenu().then((m) => ({ default: m.CollabItemMenu })));
-const CollabMenuButton = React.lazy(() => loadPageMenu().then((m) => ({ default: m.CollabMenuButton })));
+const CollabPageHistoryEntry = React.lazy(() => loadPageMenu().then((m) => ({ default: m.CollabPageHistoryEntry })));
+import { CollabMenuButton } from './primitives/CollabMenuButton';
 const CollabPageMoveDialog = React.lazy(() => import('./CollabPageMoveDialog'));
-import { CollabSearchInput } from './primitives/CollabSearchInput';
 import { DocUnreadDot } from './DocUnreadDot';
 import { bucketItemCount, trackDocumentAction } from './analytics';
 import { useCollabDocsUI, type CollabTreeFilter } from './CollabDocsUIProvider';
@@ -128,14 +130,14 @@ export interface CollabSidebarProps {
   /** The open typed page (item id) or type page (type id), highlighted like the open page. */
   activeItemId?: string | null;
   activeTypeId?: string | null;
-  /** Open the discovery hub (center pane). Shown as a Home action. */
-  onShowHome?: () => void;
-  /** Highlight the Home action when the hub is the active surface. */
-  homeActive?: boolean;
+  /** Fixed rows above the tree (the section's Home, Search and Types: `PagesSectionEntries`). */
+  sectionEntries?: React.ReactNode;
   /** Host-owned scope label and path chrome; sidebar actions remain shared. */
   scopeName?: React.ReactNode;
   scopePath?: React.ReactNode;
   headerActions?: React.ReactNode;
+  /** Host entries appended to the section's right-click menu. */
+  extraSectionMenuItems?: readonly CollabSectionMenuItem[];
   /**
    * Hosts where a folder is an addressable surface (the browser console routes
    * `/docs/folder/:folderId`). Desktop leaves this unset, so a folder click
@@ -155,6 +157,12 @@ export interface CollabSidebarProps {
    */
   typeResolver?: CollabTypeTreeResolver;
   /**
+   * Archive a typed page (the tracker's own archive, which keeps its comments
+   * and sessions). Typed pages never go to Wiki Trash; hosts without tracker
+   * writes omit it and the row offers no Archive.
+   */
+  onArchiveItem?: (itemId: string) => Promise<void>;
+  /**
    * Shows this tree as one section of a stacked sidebar ("Team", "Personal"):
    * a compact section header replaces the scope summary header.
    */
@@ -170,6 +178,9 @@ export interface CollabSidebarProps {
    * the menu's "Set type" entry is shown disabled.
    */
   onSetPageType?: (document: SharedDocument) => void;
+  /** A page action from outside the tree (the page's header menu); `onPageActionHandled` clears it. */
+  pageActionRequest?: CollabPageActionRequest | null;
+  onPageActionHandled?: () => void;
 }
 
 export interface CollabSidebarCreateMenu {
@@ -189,18 +200,21 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   activeDocumentId,
   activeItemId = null,
   activeTypeId = null,
-  onShowHome,
-  homeActive,
+  sectionEntries,
   scopeName,
   scopePath,
   headerActions,
+  extraSectionMenuItems,
   onSelectFolder,
   registerCreateMenu,
   typeResolver,
+  onArchiveItem,
   sectionTitle,
   collapsed = false,
   onToggleCollapsed,
   onSetPageType,
+  pageActionRequest,
+  onPageActionHandled,
 }) => {
   const { scope, host, session, controller } = useCollabDocsUI();
   // Per session, not the active scope: a Personal section is never active.
@@ -245,7 +259,8 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   const [sectionMenu, setSectionMenu] = useState<{ x: number; y: number } | null>(null);
   // "New page inside" a typed page: it is not in the folder list the create
   // dialog picks from, so it is offered there as one extra location.
-  const [createInsideItem, setCreateInsideItem] = useState<{ itemId: string; name: string } | null>(null);
+  // Whether `createTargetFolderId` is a page or a typed page (page tree only).
+  const [createTargetKind, setCreateTargetKind] = useState<SharedParentKind>('page');
   const [draggedType, setDraggedType] = useState<string | null>(null);
   const [draggedItem, setDraggedItem] = useState<CollabTreeItemNode | null>(null);
   const [moveTarget, setMoveTarget] = useState<
@@ -310,7 +325,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   // Legacy (path-in-title) folder rename target: these folders have no
   // first-class folderId, so the rename rewrites descendant document titles.
   const [legacyFolderToRename, setLegacyFolderToRename] = useState<{ path: string; name: string } | null>(null);
-  const [searchQuery, setSearchQuery] = useState('');
   const [createDocumentDescriptor, setCreateDocumentDescriptor] = useState<CollabDocumentTypeDescriptor | null>(null);
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [createTargetFolderId, setCreateTargetFolderId] = useState<string | null>(null);
@@ -346,7 +360,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
 
   // Full tree (all docs + first-class folders) — used for path-collision checks
   // and auto-expand, independent of the active filter.
-  const currentProjectId = session.scope.indexConfig.teamProjectId;
   const tree = useMemo(
     () => {
       if (!pageTree) return buildCollabTreeAdaptive(sharedDocuments, sharedFolders, typeTreeInput);
@@ -354,10 +367,9 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
         resolver: typeResolver,
         typePlacements,
         itemPlacements,
-        currentProjectId,
       }) ?? [];
     },
-    [currentProjectId, itemPlacements, pageTree, pageTreeBuilder, sharedDocuments, sharedFolders, typePlacements, typeResolver, typeTreeInput]
+    [itemPlacements, pageTree, pageTreeBuilder, sharedDocuments, sharedFolders, typePlacements, typeResolver, typeTreeInput]
   );
 
   // Placed subtypes shown inside their base type (see `attachTypeNodes`).
@@ -372,18 +384,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     walk(tree);
     return ids;
   }, [tree]);
-
-  const createFolderOptions = useMemo(() => (createInsideItem
-    ? [...sharedFolders, {
-      folderId: createInsideItem.itemId,
-      parentFolderId: null,
-      name: createInsideItem.name,
-      sortOrder: 0,
-      createdBy: '',
-      createdAt: 0,
-      updatedAt: 0,
-    }]
-    : sharedFolders), [createInsideItem, sharedFolders]);
 
   // Docs visible under the active segmented filter (All / Favorites / Updated).
   const visibleDocuments = useMemo(() => {
@@ -403,18 +403,12 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       // Favorites and Updated are document filters; placed types only show in All.
       if (effectiveTreeFilter !== 'all') {
         return pageTree
-          ? pageTreeBuilder?.buildCollabPageTree(visibleDocuments, { currentProjectId }) ?? []
+          ? pageTreeBuilder?.buildCollabPageTree(visibleDocuments) ?? []
           : pruneEmptyFolders(buildCollabTreeAdaptive(visibleDocuments, sharedFolders));
       }
       return pageTree ? tree : buildCollabTreeAdaptive(visibleDocuments, sharedFolders, typeTreeInput);
     },
-    [visibleDocuments, sharedFolders, effectiveTreeFilter, typeTreeInput, pageTree, pageTreeBuilder, tree, currentProjectId]
-  );
-  const trimmedSearchQuery = searchQuery.trim();
-  const hasActiveSearch = trimmedSearchQuery.length > 0;
-  const filteredTree = useMemo(
-    () => filterCollabTree(displayTree, trimmedSearchQuery),
-    [displayTree, trimmedSearchQuery]
+    [visibleDocuments, sharedFolders, effectiveTreeFilter, typeTreeInput, pageTree, pageTreeBuilder, tree]
   );
 
   const existingPaths = useMemo(() => {
@@ -525,8 +519,8 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   );
   const markdownDescriptor = sharedNewDocumentMenuItems.find(({ descriptor }) => descriptor.documentType === 'markdown')?.descriptor;
   // A new markdown page under `parentId` (null = this section's root).
-  const startNewPage = (parentId: string | null, insideItem: { itemId: string; name: string } | null = null) => {
-    setCreateInsideItem(insideItem);
+  const startNewPage = (parentId: string | null, parentKind: SharedParentKind = 'page') => {
+    setCreateTargetKind(parentKind);
     setCreateTargetFolderId(parentId);
     if (markdownDescriptor) setCreateDocumentDescriptor(markdownDescriptor);
     setContextMenu(null);
@@ -571,7 +565,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     setLegacyFolderToRename(null);
     setSelectedFolderPath(null);
     setSelectedFolderId(null);
-    setSearchQuery('');
     setExpandedFolders(new Set());
     setUserTouchedExpansion(false);
 
@@ -694,39 +687,42 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     }
   }, [host, scope, teamOrgId]);
 
+  // Page tree: a page with children goes to Trash with its subtree; a leaf
+  // page goes to Trash like any document.
+  const trashDocument = useCallback((document: SharedDocument, name: string) => {
+    const childCount = pageTree ? planPageRemoval(allSharedDocuments, typePlacements, document.documentId).childCount : 0;
+    if (childCount > 0) {
+      if (!canMutateMetadata('move this page to Trash')) return;
+      const pages = `${childCount} child page${childCount === 1 ? '' : 's'}`;
+      // Counts the prose of types placed inside it, which goes too.
+      setContextMenu(null);
+      void confirmDestructive('Move page to Trash', `Move "${pageDisplayName(name, document.documentType)}" and its ${pages} to Trash? Types and typed pages inside show in their usual place until you restore it.`).then((accepted) => {
+        if (!accepted) return;
+        session.removePage(document.documentId);
+        host.trackEvent?.('collab_folder_deleted', {
+          actorType: 'user',
+          source: 'sidebar',
+          documentCountBucket: bucketItemCount(childCount),
+          subfolderCountBucket: bucketItemCount(0),
+        });
+      });
+      return;
+    }
+    if (!canMutateMetadata('move this document to Trash')) return;
+    session.trashDocument(document.documentId);
+    trackDocumentAction(host, {
+      action: 'trashed',
+      documentType: document.documentType,
+      entryPoint: 'context_menu',
+    });
+    setContextMenu(null);
+  }, [allSharedDocuments, canMutateMetadata, host, pageTree, session, typePlacements]);
+
   const handleDelete = useCallback(() => {
     if (!contextMenu) return;
 
     if (contextMenu.node.type === 'document') {
-      const { document } = contextMenu.node;
-      // Page tree: a page with children goes to Trash with its subtree; a
-      // leaf page goes to Trash like any document.
-      const childCount = pageTree ? planPageRemoval(allSharedDocuments, typePlacements, document.documentId).childCount : 0;
-      if (childCount > 0) {
-        if (!canMutateMetadata('move this page to Trash')) return;
-        const pages = `${childCount} child page${childCount === 1 ? '' : 's'}`;
-        // Counts the prose of types placed inside it, which goes too.
-        setContextMenu(null);
-        void confirmDestructive('Move page to Trash', `Move "${pageDisplayName(contextMenu.node.name, document.documentType)}" and its ${pages} to Trash? Types and typed pages inside show in their usual place until you restore it.`).then((accepted) => {
-          if (!accepted) return;
-          session.removePage(document.documentId);
-          host.trackEvent?.('collab_folder_deleted', {
-            actorType: 'user',
-            source: 'sidebar',
-            documentCountBucket: bucketItemCount(childCount),
-            subfolderCountBucket: bucketItemCount(0),
-          });
-        });
-        return;
-      }
-      if (!canMutateMetadata('move this document to Trash')) return;
-      session.trashDocument(document.documentId);
-      trackDocumentAction(host, {
-        action: 'trashed',
-        documentType: document.documentType,
-        entryPoint: 'context_menu',
-      });
-      setContextMenu(null);
+      trashDocument(contextMenu.node.document, contextMenu.node.name);
       return;
     }
 
@@ -763,7 +759,41 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
         setSelectedFolderPath(null);
       }
     });
-  }, [allSharedDocuments, canMutateMetadata, contextMenu, host, pageTree, selectedFolderId, session, sharedFolders, typePlacements]);
+  }, [allSharedDocuments, canMutateMetadata, contextMenu, host, selectedFolderId, session, sharedFolders, trashDocument]);
+
+  // Removes the placement only; the type and its items stay.
+  const removeTypeFromTree = useCallback((typeId: string) => {
+    if (canMutateMetadata('remove this type from the tree')) session.removeTypePlacement(typeId).catch(reportTypePlacementError);
+  }, [canMutateMetadata, reportTypePlacementError, session]);
+
+  usePageActionRequest({
+    request: pageActionRequest,
+    tree,
+    onHandled: onPageActionHandled,
+    onMissing: () => showWarning('Page not found', 'This page is not in the sidebar, so the action did not run.'),
+    run: (target, action) => {
+      // A collapsed section renders its header row alone, without the dialogs
+      // (New page opens it itself).
+      if (collapsed && (action === 'rename' || action === 'moveTo')) onToggleCollapsed?.();
+      if (target.type === 'type') {
+        if (action === 'removeFromTree') removeTypeFromTree(target.typeId);
+        else if (action === 'moveTo' && nestedTypeIds.has(target.typeId)) showWarning('Cannot move this type', 'It is shown inside the type it extends.');
+        else if (action === 'moveTo') setMoveTarget({ kind: 'type', node: target });
+        return;
+      }
+      if (target.type === 'item') {
+        if (action === 'newPageInside') startNewPage(target.itemId, 'item');
+        else if (action === 'moveTo') setMoveTarget({ kind: 'item', node: target });
+        else if (action === 'backUnderType') moveItemTo(target.itemId, { underType: true });
+        return;
+      }
+      const { document } = target;
+      if (action === 'newPageInside') startNewPage(document.documentId);
+      else if (action === 'rename') setDocumentToRename(document);
+      else if (action === 'moveTo') setMoveTarget({ kind: 'page', document });
+      else if (action === 'trash') trashDocument(document, target.name);
+    },
+  });
 
   const handleCopyFolderLink = useCallback(async (folderId: string) => {
     if (!teamOrgId) {
@@ -898,33 +928,46 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     session.clearPendingFolder();
   }, [folderById, folderPathById, pendingCollabFolder, scope, session]);
 
-  const getCreationBaseFolderId = useCallback((): string | null => {
+  // Where a new item goes: the row the menu was opened on, else in a page
+  // tree the open page or typed page, else the selected folder.
+  const applyCreationBaseTarget = useCallback(() => {
+    if (pageTree && contextMenu?.node.type === 'item') {
+      setCreateTargetFolderId(contextMenu.node.itemId);
+      setCreateTargetKind('item');
+      return;
+    }
     const contextFolderId = contextMenu?.node.type === 'folder'
       ? (contextMenu.node.folderId ?? null)
       : pageTree && contextMenu?.node.type === 'document'
         ? contextMenu.node.document.documentId
         : undefined;
-    return resolveCollabCreateTargetFolderId(contextFolderId, selectedFolderId);
-  }, [contextMenu, pageTree, selectedFolderId]);
+    if (pageTree && contextFolderId === undefined && (activeItemId || activeDocumentId)) {
+      setCreateTargetFolderId(activeItemId ?? activeDocumentId ?? null);
+      setCreateTargetKind(activeItemId ? 'item' : 'page');
+      return;
+    }
+    setCreateTargetFolderId(resolveCollabCreateTargetFolderId(contextFolderId, selectedFolderId));
+    setCreateTargetKind('page');
+  }, [activeDocumentId, activeItemId, contextMenu, pageTree, selectedFolderId]);
 
   const openCreateFolderDialog = useCallback(() => {
-    setCreateTargetFolderId(getCreationBaseFolderId());
+    applyCreationBaseTarget();
     setIsCreateFolderOpen(true);
     setContextMenu(null);
-  }, [getCreationBaseFolderId]);
+  }, [applyCreationBaseTarget]);
 
   const openCreateDocumentMenu = useCallback((reference: HTMLElement) => {
-    setCreateTargetFolderId(getCreationBaseFolderId());
+    applyCreationBaseTarget();
     newDocumentMenu.refs.setReference(reference);
     newDocumentMenu.setIsOpen(true);
     setContextMenu(null);
-  }, [getCreationBaseFolderId, newDocumentMenu.refs, newDocumentMenu.setIsOpen]);
+  }, [applyCreationBaseTarget, newDocumentMenu.refs, newDocumentMenu.setIsOpen]);
 
   // Handlers via ref, effect keyed on a content signature. Depending on the
   // callbacks directly republishes on every render, and the host turns that
   // into a re-render, which loops.
-  const createHandlersRef = useRef({ getCreationBaseFolderId, openCreateFolderDialog });
-  createHandlersRef.current = { getCreationBaseFolderId, openCreateFolderDialog };
+  const createHandlersRef = useRef({ applyCreationBaseTarget, openCreateFolderDialog });
+  createHandlersRef.current = { applyCreationBaseTarget, openCreateFolderDialog };
 
   const sharedTypeSignature = sharedNewDocumentMenuItems
     .map(({ descriptor }) => `${descriptor.documentType}:${descriptor.defaultExtension}`)
@@ -941,7 +984,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       destination: selectedFolderPath,
       primaryTrailing: markdown?.descriptor.defaultExtension,
       onPrimary: () => {
-        setCreateTargetFolderId(createHandlersRef.current.getCreationBaseFolderId());
+        createHandlersRef.current.applyCreationBaseTarget();
         if (markdown) setCreateDocumentDescriptor(markdown.descriptor);
       },
       onNewFolder: () => createHandlersRef.current.openCreateFolderDialog(),
@@ -955,7 +998,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
           icon: descriptor.icon,
           trailing: descriptor.defaultExtension,
           onSelect: () => {
-            setCreateTargetFolderId(createHandlersRef.current.getCreationBaseFolderId());
+            createHandlersRef.current.applyCreationBaseTarget();
             setCreateDocumentDescriptor(descriptor);
           },
         })),
@@ -1002,12 +1045,17 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     setContextMenu(null);
   }, [canMutateMetadata, createTargetFolderId, existingPaths, folderPathById, host, session, showWarning]);
 
+  const changeCreateTarget = useCallback((parentId: string | null, parentKind: SharedParentKind = 'page') => {
+    setCreateTargetFolderId(parentId);
+    setCreateTargetKind(parentKind);
+  }, []);
+
   const handleCreateDocument = useCallback(async (documentName: string) => {
     if (!canMutateMetadata('create documents')) return;
     const descriptor = createDocumentDescriptor;
     if (!descriptor) return;
     const parentId = createTargetFolderId;
-    const insideItem = parentId !== null && createInsideItem?.itemId === parentId;
+    const insideItem = parentId !== null && createTargetKind === 'item';
     const parentPath = insideItem ? `item:${parentId}` : parentId ? (folderPathById.get(parentId) ?? '') : '';
     try {
       await session.createDocument({
@@ -1034,9 +1082,9 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     setSelectedFolderPath(insideItem ? null : parentPath || null);
     setSelectedFolderId(insideItem ? null : parentId);
     setCreateDocumentDescriptor(null);
-    setCreateInsideItem(null);
+    setCreateTargetKind('page');
     setContextMenu(null);
-  }, [canMutateMetadata, createDocumentDescriptor, createInsideItem, createTargetFolderId, folderPathById, host, scope, session]);
+  }, [canMutateMetadata, createDocumentDescriptor, createTargetFolderId, createTargetKind, folderPathById, host, scope, session]);
 
   const handleRenameDocument = useCallback(async (documentName: string) => {
     if (!documentToRename) return;
@@ -1336,10 +1384,10 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     onDragStart: setDraggedItem,
     onDragEnd: clearRowDrag,
     rowDrop,
-    isExpanded: (node: CollabTreeItemNode) => hasActiveSearch || expandedFolders.has(node.id),
-    onToggle: (node: CollabTreeItemNode) => { if (!hasActiveSearch) toggleFolder(node.id); },
+    isExpanded: (node: CollabTreeItemNode) => expandedFolders.has(node.id),
+    onToggle: (node: CollabTreeItemNode) => toggleFolder(node.id),
     renderChildren: (nodes: CollabTreeNode[], childIndent: number) => renderTreeRef.current(nodes, (childIndent - 8) / 16),
-  } : undefined), [clearRowDrag, expandedFolders, handleContextMenu, hasActiveSearch, pageTree, rowDrop, toggleFolder]);
+  } : undefined), [clearRowDrag, expandedFolders, handleContextMenu, pageTree, rowDrop, toggleFolder]);
 
   const renderTree = useCallback((nodes: CollabTreeNode[], depth = 0): React.ReactNode => {
     return nodes.map((node) => {
@@ -1353,7 +1401,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
             node={node}
             position={0}
             indent={indent}
-            onOpen={() => host.openArtifact({ kind: 'tracker', scope, trackerId: node.itemId }, 'sidebar')}
+            onOpen={(options) => host.openArtifact({ kind: 'tracker', scope, trackerId: node.itemId }, 'sidebar', options)}
             actions={itemRowActions}
           />
         ) : null;
@@ -1365,10 +1413,10 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
             key={node.id}
             node={node}
             indent={indent}
-            expanded={hasActiveSearch || expandedFolders.has(node.id)}
-            onToggle={() => { if (!hasActiveSearch) toggleFolder(node.id); }}
-            onOpenType={(typeId) => host.openArtifact({ kind: 'type', scope, typeId }, 'sidebar')}
-            onOpenItem={(trackerId) => host.openArtifact({ kind: 'tracker', scope, trackerId }, 'sidebar')}
+            expanded={expandedFolders.has(node.id)}
+            onToggle={() => toggleFolder(node.id)}
+            onOpenType={(typeId, options) => host.openArtifact({ kind: 'type', scope, typeId }, 'sidebar', options)}
+            onOpenItem={(trackerId, options) => host.openArtifact({ kind: 'tracker', scope, trackerId }, 'sidebar', options)}
             onContextMenu={(event) => handleContextMenu(event, node)}
             onDragStart={setDraggedType}
             onDragEnd={clearRowDrag}
@@ -1379,7 +1427,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       }
 
       if (node.type === 'folder') {
-        const isExpanded = hasActiveSearch || expandedFolders.has(node.path);
+        const isExpanded = expandedFolders.has(node.path);
         const isSelected = selectedFolderPath === node.path;
         const isDropTarget = dropTargetPath === node.path;
 
@@ -1401,9 +1449,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
                 setDropTargetPath(null);
               }}
               onClick={() => {
-                if (!hasActiveSearch) {
-                  toggleFolder(node.path);
-                }
+                toggleFolder(node.path);
                 setSelectedFolderPath(node.path);
                 setSelectedFolderId(node.folderId ?? null);
                 onSelectFolder?.(node.folderId ?? null);
@@ -1503,7 +1549,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       const typePresentation = resolveSharedDocumentTypePresentation(node.document, documentTypeDescriptors);
       // Page tree: a page with children expands like a folder and takes drops.
       const hasChildren = (node.children?.length ?? 0) > 0;
-      const isPageExpanded = hasChildren && (hasActiveSearch || expandedFolders.has(node.path));
+      const isPageExpanded = hasChildren && expandedFolders.has(node.path);
       const { className: dropClassName = '', ...pageDropProps } = pageTree ? rowDrop(node) : {};
 
       const row = (
@@ -1513,14 +1559,14 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
           className={`group w-full flex items-center text-left file-tree-file${isActive ? ' active' : ''}${dropClassName}`}
           style={{ paddingLeft: indent }}
           {...pageDropProps}
-          onClick={() => {
+          onClick={(event) => {
             setSelectedFolderPath(getCollabParentPath(node.path));
             host.openArtifact({
               kind: 'document',
               scope,
               documentId: node.document.documentId,
               teamProjectId: node.document.teamProjectId,
-            }, 'sidebar');
+            }, 'sidebar', collabOpenOptions(event));
           }}
           onContextMenu={(event) => handleContextMenu(event, node)}
           draggable
@@ -1559,7 +1605,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                if (!hasActiveSearch) toggleFolder(node.path);
+                toggleFolder(node.path);
               }}
             >
               <MaterialSymbol icon={isPageExpanded ? 'keyboard_arrow_down' : 'keyboard_arrow_right'} size={16} />
@@ -1624,7 +1670,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     moveDraggedDocument,
     moveDraggedFolder,
     selectedFolderPath,
-    hasActiveSearch,
     toggleFolder,
     favoriteSet,
     personalStateAvailable,
@@ -1638,7 +1683,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   ]);
   renderTreeRef.current = renderTree;
 
-  const selectedFolderLabel = selectedFolderPath ? getCollabNodeName(selectedFolderPath) : 'Pages';
+  const selectedFolderLabel = selectedFolderPath ? getCollabNodeName(selectedFolderPath) : 'Wiki';
   const contextDocument = contextMenu?.node.type === 'document' ? contextMenu.node.document : null;
   const useLocalOrigin = controller.useLocalOrigin ?? useUnavailableLocalOrigin;
   const contextLocalOrigin = useLocalOrigin(
@@ -1650,22 +1695,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   const headerActionButtons = (
     <>
       {headerActions}
-      {onShowHome && (
-        <button
-          type="button"
-          className={`workspace-action-button bg-transparent border-none p-1.5 cursor-pointer rounded flex items-center justify-center transition-all duration-200 relative hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)] ${
-            homeActive ? 'text-[var(--nim-primary)]' : 'text-[var(--nim-text-faint)]'
-          }`}
-          title="Discovery home"
-          aria-label="Discovery home"
-          onClick={() => {
-            onShowHome();
-            setContextMenu(null);
-          }}
-        >
-          <MaterialSymbol icon="grid_view" size={16} />
-        </button>
-      )}
       {/* New document / New folder moved to the host's title-bar create
           control, which sits directly over this tree. The folder context
           menu still covers "create here". */}
@@ -1714,6 +1743,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
         if (collapsed) onToggleCollapsed?.();
         setPlaceTypeMenu({ ...sectionMenu, parentFolderId: null });
       } : undefined}
+      extraItems={extraSectionMenuItems}
       onClose={() => setSectionMenu(null)}
     />
   );
@@ -1800,15 +1830,6 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       </div>
       )}
 
-      <div className="session-history-search px-3 py-2 border-b border-[var(--nim-border)] shrink-0">
-        <CollabSearchInput
-          value={searchQuery}
-          onChange={setSearchQuery}
-          placeholder={personal ? 'Search personal pages...' : 'Search shared documents...'}
-          label={personal ? 'Search personal pages' : 'Search shared documents'}
-        />
-      </div>
-
       {/* Document tree */}
       <div
         className={`collab-sidebar-tree flex-1 overflow-y-auto px-1.5 py-2 transition-colors ${dropTargetPath === '__root__' ? 'bg-nim-hover' : ''}`}
@@ -1869,6 +1890,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
           void moveDraggedDocument(null, null);
         }}
       >
+        {sectionEntries}
         {(() => {
           // Loading: still resolving workspace state, or team sync is mid-
           // handshake. Render a skeleton instead of an empty/folders-only
@@ -1891,25 +1913,21 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
           }
           const emptyReason = tree.length === 0
             ? 'empty'
-            : filteredTree.length > 0
-              ? null
-              : hasActiveSearch
-                ? 'search'
-                : effectiveTreeFilter === 'all' ? null : effectiveTreeFilter;
+            : displayTree.length > 0 || effectiveTreeFilter === 'all' ? null : effectiveTreeFilter;
           if (emptyReason) {
             return (
               <CollabTreeEmptyState
                 reason={emptyReason}
                 personal={personal}
                 scopeAvailable={scopeAvailable}
-                searchQuery={trimmedSearchQuery}
                 onNewPage={markdownDescriptor ? () => startNewPage(null) : undefined}
               />
             );
           }
-          return <CollabTreeActiveContext.Provider value={activeRow}><div>{renderTree(filteredTree)}</div></CollabTreeActiveContext.Provider>;
+          return <CollabTreeActiveContext.Provider value={activeRow}><div>{renderTree(displayTree)}</div></CollabTreeActiveContext.Provider>;
         })()}
       </div>
+      {scopeAvailable && <CollabSidebarTrashEntry sectionLabel={sectionTitle ?? (personal ? 'Personal' : 'Team')} />}
 
       {/* Header overflow menu: unread-bubble visibility + mark all read */}
       {readReceiptsAvailable && overflowMenu.isOpen && (
@@ -2070,21 +2088,28 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               className="collab-remove-type-placement w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover"
               onClick={() => {
                 if (contextMenu.node.type !== 'type') return;
-                const { typeId } = contextMenu.node;
                 setContextMenu(null);
-                // Removes the placement only; the type and its items stay.
-                if (canMutateMetadata('remove this type from the tree')) session.removeTypePlacement(typeId).catch(reportTypePlacementError);
+                removeTypeFromTree(contextMenu.node.typeId);
               }}
             >
               <MaterialSymbol icon="playlist_remove" size={18} />
               <span>Remove from tree</span>
             </button>
+            {/* The type page's prose has a history of its own. */}
+            <CollabPageHistoryEntry
+              onClick={() => {
+                if (contextMenu.node.type !== 'type') return;
+                const { typeId } = contextMenu.node;
+                setContextMenu(null);
+                host.openArtifact({ kind: 'type', scope, typeId }, 'history');
+              }}
+            />
             </>
           ) : contextMenu.node.type === 'item' ? (
             <CollabItemMenu
               onNewPageInside={() => {
                 if (contextMenu.node.type !== 'item') return;
-                startNewPage(contextMenu.node.itemId, { itemId: contextMenu.node.itemId, name: contextMenu.node.name });
+                startNewPage(contextMenu.node.itemId, 'item');
               }}
               onPlaceType={typeResolver ? () => {
                 if (contextMenu.node.type !== 'item') return;
@@ -2100,6 +2125,24 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
                 if (contextMenu.node.type === 'item') moveItemTo(contextMenu.node.itemId, { underType: true });
                 setContextMenu(null);
               }}
+              onHistory={() => {
+                if (contextMenu.node.type !== 'item') return;
+                const { itemId } = contextMenu.node;
+                setContextMenu(null);
+                host.openArtifact({ kind: 'tracker', scope, trackerId: itemId }, 'history');
+              }}
+              onArchive={onArchiveItem ? () => {
+                if (contextMenu.node.type !== 'item') return;
+                const { itemId, name } = contextMenu.node;
+                setContextMenu(null);
+                void confirmDestructive(
+                  'Archive page',
+                  `Archive "${name}"? It leaves the Wiki and its type's table, with its comments and sessions kept. Restore it from its tracker's Archived view.`,
+                  'Archive',
+                ).then((accepted) => {
+                  if (accepted) onArchiveItem(itemId).catch(reportTypePlacementError);
+                });
+              } : undefined}
             />
           ) : (
             <>
@@ -2128,63 +2171,37 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
                   }}
                   copyLinkDisabled={!teamOrgId}
                 />
-              ) : <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover"
+              ) : <CollabMenuButton
+                icon="open_in_new"
+                label="Open"
                 onClick={() => {
                   if (!contextDocument) return;
-                  host.openArtifact({
-                    kind: 'document',
-                    scope,
-                    documentId: contextDocument.documentId,
-                    teamProjectId: contextDocument.teamProjectId,
-                  }, 'sidebar');
+                  host.openArtifact({ kind: 'document', scope, documentId: contextDocument.documentId, teamProjectId: contextDocument.teamProjectId }, 'sidebar');
                   setContextMenu(null);
                 }}
-              >
-                <MaterialSymbol icon="open_in_new" size={18} />
-                <span>Open</span>
-              </button>}
-              {personalStateAvailable && <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover"
+              />}
+              {personalStateAvailable && contextDocument && <CollabMenuButton
+                icon="star"
+                fill={favoriteSet.has(contextDocument.documentId)}
+                label={favoriteSet.has(contextDocument.documentId) ? 'Unfavorite' : 'Favorite'}
                 onClick={() => {
-                  if (!contextDocument) return;
                   handleToggleFavorite(contextDocument);
                   setContextMenu(null);
                 }}
-              >
-                <MaterialSymbol
-                  icon="star"
-                  size={18}
-                  fill={contextDocument ? favoriteSet.has(contextDocument.documentId) : false}
-                />
-                <span>
-                  {contextDocument && favoriteSet.has(contextDocument.documentId)
-                    ? 'Unfavorite'
-                    : 'Favorite'}
-                </span>
-              </button>}
-              {readReceiptsAvailable && <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
-                disabled={
-                  !teamOrgId ||
-                  !contextDocument ||
-                  !changedDocIds.has(contextDocument.documentId)
-                }
+              />}
+              {readReceiptsAvailable && <CollabMenuButton
+                icon="mark_email_read"
+                label="Mark as read"
+                disabled={!teamOrgId || !contextDocument || !changedDocIds.has(contextDocument.documentId)}
                 onClick={() => {
                   if (!contextDocument) return;
                   handleMarkDocRead(contextDocument);
                   setContextMenu(null);
                 }}
-              >
-                <MaterialSymbol icon="mark_email_read" size={18} />
-                <span>Mark as read</span>
-              </button>}
-              {!pageTree && <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+              />}
+              {!pageTree && <CollabMenuButton
+                icon="link"
+                label="Copy Link"
                 disabled={!teamOrgId}
                 title={teamOrgId ? undefined : 'No team is connected to this workspace'}
                 onClick={() => {
@@ -2192,113 +2209,63 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
                   setContextMenu(null);
                   void handleCopyLink(contextDocument);
                 }}
-              >
-                <MaterialSymbol icon="link" size={18} />
-                <span>Copy Link</span>
-              </button>}
-              <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+              />}
+              <CollabMenuButton
+                icon="history"
+                label="View History"
                 disabled={!teamOrgId}
                 title={teamOrgId ? undefined : 'No team is connected to this workspace'}
                 onClick={() => {
                   if (!contextDocument || !teamOrgId) return;
                   setContextMenu(null);
-                  host.openArtifact(
-                    {
-                      kind: 'document',
-                      scope,
-                      documentId: contextDocument.documentId,
-                      teamProjectId: contextDocument.teamProjectId,
-                    },
-                    'history',
-                  );
+                  host.openArtifact({ kind: 'document', scope, documentId: contextDocument.documentId, teamProjectId: contextDocument.teamProjectId }, 'history');
                 }}
-              >
-                <MaterialSymbol icon="history" size={18} />
-                <span>View History</span>
-              </button>
+              />
               {/* Rename is a worker-backed metadata mutation, not a local-file
                   action. It lived inside the local-origin block because desktop
                   renames the mirrored file too, which silently removed Rename
                   from any host that omits the desktop-only controller. */}
-              {!pageTree && <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover"
+              {!pageTree && <CollabMenuButton
+                icon="edit"
+                label="Rename"
                 onClick={() => {
                   if (!contextDocument) return;
                   setDocumentToRename(contextDocument);
                   setContextMenu(null);
                 }}
-              >
-                <MaterialSymbol icon="edit" size={18} />
-                <span>Rename</span>
-              </button>}
+              />}
               {contextLocalOrigin.available ? <>
-              <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
-                disabled={!contextLocalOrigin.hasResolvedBinding || contextLocalOrigin.busyAction !== null}
-                onClick={() => {
-                  setContextMenu(null);
-                  void contextLocalOrigin.openLocalSource();
-                }}
-              >
-                <MaterialSymbol icon="draft" size={18} />
-                <span>Open Local Source</span>
-              </button>
-              <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
-                disabled={!contextLocalOrigin.binding || contextLocalOrigin.busyAction !== null}
-                onClick={() => {
-                  setContextMenu(null);
-                  void contextLocalOrigin.reuploadFromLocalSource();
-                }}
-              >
-                <MaterialSymbol icon="upload" size={18} />
-                <span>Re-upload From Local</span>
-              </button>
-              <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
-                disabled={contextLocalOrigin.busyAction !== null}
-                onClick={() => {
-                  setContextMenu(null);
-                  void contextLocalOrigin.relinkLocalSource();
-                }}
-              >
-                <MaterialSymbol icon="link" size={18} />
-                <span>{contextLocalOrigin.binding ? 'Relink Local Source...' : 'Link Local Source...'}</span>
-              </button>
-              {contextLocalOrigin.binding && (
-                <button
-                  type="button"
-                  className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                <CollabMenuButton
+                  icon="draft"
+                  label="Open Local Source"
+                  disabled={!contextLocalOrigin.hasResolvedBinding || contextLocalOrigin.busyAction !== null}
+                  onClick={() => { setContextMenu(null); void contextLocalOrigin.openLocalSource(); }}
+                />
+                <CollabMenuButton
+                  icon="upload"
+                  label="Re-upload From Local"
+                  disabled={!contextLocalOrigin.binding || contextLocalOrigin.busyAction !== null}
+                  onClick={() => { setContextMenu(null); void contextLocalOrigin.reuploadFromLocalSource(); }}
+                />
+                <CollabMenuButton
+                  icon="link"
+                  label={contextLocalOrigin.binding ? 'Relink Local Source...' : 'Link Local Source...'}
                   disabled={contextLocalOrigin.busyAction !== null}
-                  onClick={() => {
-                    setContextMenu(null);
-                    void contextLocalOrigin.clearLocalSource();
-                  }}
-                >
-                  <MaterialSymbol icon="link_off" size={18} />
-                  <span>Clear Local Source</span>
-                </button>
-              )}
+                  onClick={() => { setContextMenu(null); void contextLocalOrigin.relinkLocalSource(); }}
+                />
+                {contextLocalOrigin.binding && <CollabMenuButton
+                  icon="link_off"
+                  label="Clear Local Source"
+                  disabled={contextLocalOrigin.busyAction !== null}
+                  onClick={() => { setContextMenu(null); void contextLocalOrigin.clearLocalSource(); }}
+                />}
               </> : null}
               {pageTree && contextDocument ? (
                 <CollabPageDeleteEntry
                   childCount={planPageRemoval(allSharedDocuments, typePlacements, contextDocument.documentId).childCount}
                   onDelete={handleDelete}
                 />
-              ) : <button
-                type="button"
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim-error hover:bg-nim-hover"
-                onClick={handleDelete}
-              >
-                <MaterialSymbol icon="delete" size={18} />
-                <span>Move to Trash</span>
-              </button>}
+              ) : <CollabMenuButton icon="delete" danger label="Move to Trash" onClick={handleDelete} />}
             </>
           )}
           </React.Suspense>
@@ -2359,13 +2326,17 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
         isOpen={createDocumentDescriptor !== null}
         kind="document"
         documentDescriptor={createDocumentDescriptor ?? undefined}
-        folders={createFolderOptions}
+        folders={sharedFolders}
+        tree={pageTree ? tree : undefined}
+        documentTypeDescriptors={documentTypeDescriptors}
+        rootLabel={pageTree ? (personal ? 'Personal' : 'Team') : undefined}
         targetFolderId={createTargetFolderId}
-        onTargetFolderChange={setCreateTargetFolderId}
+        targetParentKind={createTargetKind}
+        onTargetFolderChange={changeCreateTarget}
         onConfirm={handleCreateDocument}
         onCancel={() => {
           setCreateDocumentDescriptor(null);
-          setCreateInsideItem(null);
+          setCreateTargetKind('page');
           setContextMenu(null);
         }}
       />

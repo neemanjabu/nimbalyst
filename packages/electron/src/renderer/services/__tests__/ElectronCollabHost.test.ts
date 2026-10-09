@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
 import { parseTrackerDeepLink } from '../../../shared/trackerDeepLinks';
 import { historyDialogFileAtom } from '../../store/atoms/historyDialog';
+import { buildCollabUri } from '@nimbalyst/collab-protocol';
 
 const personalStateMocks = vi.hoisted(() => ({
   getForScope: vi.fn(),
@@ -230,8 +231,14 @@ describe('ElectronCollabHost personal state', () => {
 
     host.openArtifact(ref, 'history');
 
-    expect(openArtifact).toHaveBeenCalledWith(ref, 'history');
+    expect(openArtifact).toHaveBeenCalledWith(ref, 'history', undefined);
     expect(store.get(historyDialogFileAtom)).toBe('collab://org:org-1:doc:doc-1');
+
+    // A typed page's body and a type page's prose are rooms of their own.
+    host.openArtifact({ kind: 'tracker', scope, trackerId: 'item-1' }, 'history');
+    expect(store.get(historyDialogFileAtom)).toBe(buildCollabUri('org-1', 'tracker-content/item-1'));
+    host.openArtifact({ kind: 'type', scope, typeId: 'module' }, 'history');
+    expect(store.get(historyDialogFileAtom)).toBe(buildCollabUri('org-1', 'type-page:module'));
   });
 
   // A window opened before sign-in resolves once, fails non-retryably, and the
